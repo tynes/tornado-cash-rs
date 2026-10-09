@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 tornado-cash-rs.workspace = true
-alloy = { version = "1", default-features = false, features = ["std", "signers", "signer-local"] }
+alloy = { version = "2", default-features = false, features = ["std", "signers", "signer-local"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"

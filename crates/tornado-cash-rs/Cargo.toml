@@ -11,7 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-alloy = { version = "1", default-features = false, features = ["std", "providers", "provider-http", "reqwest-rustls-tls", "signers", "signer-local", "sol-types", "contract", "network", "rpc-types", "json"] }
+alloy = { version = "2", default-features = false, features = ["std", "providers", "provider-http", "reqwest-rustls-tls", "signers", "signer-local", "sol-types", "contract", "network", "rpc-types", "json"] }
 ark-bn254 = "0.5"
 ark-ec = "0.5"
 ark-ff = "0.5"
