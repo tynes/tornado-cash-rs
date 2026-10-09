@@ -76,4 +76,7 @@ history up to the fork block and caches it under `target/fork-test-cache/` (`FOR
 
 ## License
 
-MIT OR Apache-2.0
+GPL-3.0-or-later; see [COPYING](COPYING). The witness calculator in
+`crates/tornado-cash-rs/src/prover/witness.js` is a port of snarkjs 0.1's
+`calculateWitness` (Copyright 2018 0kims association, GPL-3.0-or-later), so the
+crates are distributed under the same license.

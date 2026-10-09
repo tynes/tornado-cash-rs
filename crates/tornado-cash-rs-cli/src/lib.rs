@@ -3,7 +3,7 @@
 //! The binary is a thin wrapper around [`run`], which lets tests drive the CLI
 //! in-process.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{bail, Context, Result};
 pub use clap::Parser;
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tornado_cash_rs::chains::{all_chains, chain_by_id, format_units, parse_units, Tier};
 use tornado_cash_rs::db::{NoteDb, NoteStatus};
-use tornado_cash_rs::eth::{DepositCache, SyncOptions, TornadoClient};
+use tornado_cash_rs::eth::{build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::Prover;
 use tornado_cash_rs::relayer::RelayerClient;
@@ -160,7 +160,7 @@ impl App {
         &self,
         client: &TornadoClient,
         pool: &tornado_cash_rs::chains::Pool,
-    ) -> Result<DepositCache> {
+    ) -> Result<Vec<B256>> {
         let dir = self.cache_dir();
         let mut cache = DepositCache::load(&dir, pool, client.chain.chain_id);
         eprint!(
@@ -168,20 +168,19 @@ impl App {
             pool.amount,
             pool.currency.to_uppercase()
         );
-        let r = client
-            .sync_deposits(pool, &mut cache, &self.sync, |done, target| {
-                eprint!(
-                    "\rSyncing deposits for {} {}: block {done}/{target}",
-                    pool.amount,
-                    pool.currency.to_uppercase()
-                );
-            })
-            .await;
-        // Keep whatever was fetched even if the scan stopped early.
+        let r = sync_deposits(client, pool, &mut cache, &self.sync, |done, target| {
+            eprint!(
+                "\rSyncing deposits for {} {}: block {done}/{target}",
+                pool.amount,
+                pool.currency.to_uppercase()
+            );
+        })
+        .await;
+        // Keep whatever finalized blocks were fetched even if the scan stopped early.
         cache.save(&dir)?;
-        eprintln!(" ({} deposits)", cache.commitments.len());
-        r?;
-        Ok(cache)
+        let commitments = r?;
+        eprintln!(" ({} deposits)", commitments.len());
+        Ok(commitments)
     }
 }
 
@@ -237,6 +236,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         http: http.build()?,
         sync: SyncOptions {
             max_block_span: cli.log_span,
+            ..Default::default()
         },
     };
 
@@ -355,10 +355,8 @@ async fn withdraw(
         bail!("pass --relayer <url>, or --self-relay to pay gas from your own account (which links it to this withdrawal)");
     }
     let mut db = app.open_db()?;
+    // The local status is only a hint; the chain decides whether the note is spent.
     let rec = db.get(id)?.clone();
-    if rec.status == NoteStatus::Spent {
-        bail!("note {} is already spent", rec.id);
-    }
     let signer = if self_relay { Some(signer()?) } else { None };
     let client = app.client(signer).await?;
     if client.chain.chain_id != rec.note.chain_id {
@@ -390,8 +388,8 @@ async fn withdraw(
         );
     }
 
-    let cache = app.synced_cache(&client, &pool).await?;
-    let tree = cache.tree()?;
+    let commitments = app.synced_cache(&client, &pool).await?;
+    let tree = build_tree(&commitments)?;
     let leaf = tree
         .index_of(&rec.note.commitment())
         .context("deposit not found in the pool's events; is the deposit mined?")?;
@@ -460,9 +458,21 @@ async fn withdraw(
         client.withdraw(&pool, &proof).await?
     };
 
+    // Never trust a relayer's word that the withdrawal happened: only mark the
+    // note spent once the receipt shows this pool emitting our nullifier hash.
+    db.update(&rec.id, |r| r.withdraw_tx = Some(tx))?;
+    if let Err(e) = client
+        .confirm_withdrawal(&pool, tx, rec.note.nullifier_hash_bytes())
+        .await
+    {
+        bail!(
+            "could not confirm withdrawal tx {tx} on-chain ({e}); note {} is still marked unspent. \
+             Run `tornado-rs balances --check` later, or withdraw again if the tx never landed",
+            rec.id
+        );
+    }
     db.update(&rec.id, |r| {
         r.status = NoteStatus::Spent;
-        r.withdraw_tx = Some(tx);
         r.withdraw_recipient = Some(recipient);
     })?;
     println!("Withdrew note {} in {}", rec.id, client.tx_url(&tx));
@@ -473,23 +483,49 @@ async fn balances(app: &App, check: bool) -> Result<()> {
     let mut db = app.open_db()?;
     if check {
         let client = app.client(None).await?;
+        // Re-check every note on this chain, including ones marked spent locally,
+        // so a wrong local status can always be repaired from the chain.
         let ids: Vec<String> = db
             .notes()
             .iter()
-            .filter(|r| r.status != NoteStatus::Spent && r.note.chain_id == client.chain.chain_id)
+            .filter(|r| r.note.chain_id == client.chain.chain_id)
             .map(|r| r.id.clone())
             .collect();
+        let mut synced: std::collections::HashMap<Address, Vec<B256>> = Default::default();
         for id in ids {
             let rec = db.get(&id)?.clone();
             let Ok(pool) = client.chain.pool(&rec.note.currency, &rec.note.amount) else {
                 continue;
             };
-            if client
-                .is_spent(pool, rec.note.nullifier_hash_bytes())
-                .await?
-            {
+            let pool = pool.clone();
+            if rec.status == NoteStatus::Pending {
+                // A deposit can be mined after the CLI lost track of it (crash, RPC
+                // timeout); promote it once its commitment shows up in the events.
+                if let std::collections::hash_map::Entry::Vacant(e) = synced.entry(pool.address) {
+                    e.insert(app.synced_cache(&client, &pool).await?);
+                }
+                // Hash once: the Pedersen hash is slow and pools hold ~10^5 deposits.
+                let commitment = rec.note.commitment_bytes();
+                let leaf = synced[&pool.address].iter().position(|c| *c == commitment);
+                let Some(leaf) = leaf else { continue };
+                eprintln!("note {id} found on-chain at leaf {leaf}; marking deposited");
+                db.update(&id, |r| {
+                    r.status = NoteStatus::Deposited;
+                    r.leaf_index = Some(leaf as u32);
+                })?;
+            }
+            let spent = client
+                .is_spent(&pool, rec.note.nullifier_hash_bytes())
+                .await?;
+            let status = db.get(&id)?.status;
+            if spent && status != NoteStatus::Spent {
                 eprintln!("note {id} is spent on-chain; updating");
                 db.update(&id, |r| r.status = NoteStatus::Spent)?;
+            } else if !spent && status == NoteStatus::Spent {
+                eprintln!(
+                    "note {id} is marked spent but its nullifier is unused on-chain; restoring"
+                );
+                db.update(&id, |r| r.status = NoteStatus::Deposited)?;
             }
         }
     }
@@ -563,11 +599,9 @@ async fn notes(app: &App, cmd: NotesCmd) -> Result<()> {
             if app.rpc_url.is_some() {
                 let client = app.client(None).await?;
                 if client.chain.chain_id == note.chain_id {
-                    let cache = app.synced_cache(&client, &pool).await?;
-                    leaf = cache
-                        .commitments
-                        .iter()
-                        .position(|c| *c == note.commitment_bytes());
+                    let commitments = app.synced_cache(&client, &pool).await?;
+                    let commitment = note.commitment_bytes();
+                    leaf = commitments.iter().position(|c| *c == commitment);
                     if leaf.is_some() {
                         status = if client.is_spent(&pool, note.nullifier_hash_bytes()).await? {
                             NoteStatus::Spent

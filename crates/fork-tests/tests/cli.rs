@@ -5,7 +5,7 @@
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use std::path::Path;
-use tornado_cash_rs::db::{NoteDb, NoteStatus, NoteRecord};
+use tornado_cash_rs::db::{NoteDb, NoteRecord, NoteStatus};
 use tornado_cash_rs::eth::DepositCache;
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs_cli::{run, Cli, Parser};
@@ -48,7 +48,10 @@ async fn data_dir(fork: &Fork) -> tempfile::TempDir {
     let client = fork.client(None).await;
     for (currency, amount) in [("eth", "0.1")] {
         let pool = client.chain.pool(currency, amount).unwrap();
-        base_cache(pool).await.save(&dir.path().join("cache")).unwrap();
+        base_cache(pool)
+            .await
+            .save(&dir.path().join("cache"))
+            .unwrap();
     }
     std::os::unix::fs::symlink(artifacts_dir().await, dir.path().join("artifacts")).unwrap();
     dir
@@ -86,29 +89,39 @@ async fn deposit_sync_withdraw_self_relay() {
     assert!(rec.deposit_tx.is_some());
     assert_eq!(rec.pool, pool.address);
 
+    // The new deposit is fewer than 64 blocks deep, so sync reads it but
+    // leaves the on-disk cache at the fork block.
     tornado(&fork, d, &["sync", "eth", "0.1"]).await.unwrap();
     let cache = DepositCache::load(&d.join("cache"), &pool, 1);
-    assert_eq!(cache.commitments.len() as u32, next + 1);
-    assert_eq!(cache.commitments[next as usize], rec.note.commitment_bytes());
+    assert_eq!(cache.last_block, fork.block);
+    assert_eq!(cache.commitments.len() as u32, next);
 
     tornado(&fork, d, &["balances", "--check"]).await.unwrap();
     assert_eq!(notes(d)[0].status, NoteStatus::Deposited);
 
     let recipient = Address::random();
     let to = recipient.to_string();
-    tornado(&fork, d, &["withdraw", &rec.id, &to, "--self-relay", "--yes"])
-        .await
-        .unwrap();
+    tornado(
+        &fork,
+        d,
+        &["withdraw", &rec.id, &to, "--self-relay", "--yes"],
+    )
+    .await
+    .unwrap();
     let rec = notes(d).pop().unwrap();
     assert_eq!(rec.status, NoteStatus::Spent);
     assert_eq!(rec.withdraw_recipient, Some(recipient));
     assert_eq!(fork.balance(recipient).await, pool.denomination());
 
     // A spent note is refused before anything is sent.
-    let err = tornado(&fork, d, &["withdraw", &rec.id, &to, "--self-relay", "--yes"])
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("already spent"), "{err}");
+    let err = tornado(
+        &fork,
+        d,
+        &["withdraw", &rec.id, &to, "--self-relay", "--yes"],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("already withdrawn"), "{err}");
 
     tornado(&fork, d, &["balances", "--check"]).await.unwrap();
     tornado(&fork, d, &["stats"]).await.unwrap();
@@ -130,9 +143,19 @@ async fn import_and_withdraw_through_relayer() {
     let note = Note::random(1, "eth", "0.1");
     let r = depositor.deposit(&pool, &note).await.unwrap();
 
-    tornado(&fork, d, &["notes", "import", &note.to_note_string(), "--label", "imported"])
-        .await
-        .unwrap();
+    tornado(
+        &fork,
+        d,
+        &[
+            "notes",
+            "import",
+            &note.to_note_string(),
+            "--label",
+            "imported",
+        ],
+    )
+    .await
+    .unwrap();
     let rec = notes(d).pop().unwrap();
     assert_eq!(rec.status, NoteStatus::Deposited);
     assert_eq!(rec.leaf_index, Some(r.leaf_index));

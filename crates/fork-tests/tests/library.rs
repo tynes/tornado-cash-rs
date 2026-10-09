@@ -3,7 +3,7 @@
 
 use alloy::primitives::{Address, U256};
 use tornado_cash_rs::chains::Pool;
-use tornado_cash_rs::eth::TornadoClient;
+use tornado_cash_rs::eth::{build_tree, TornadoClient};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::WithdrawProof;
 use tornado_cash_rs::relayer::RelayerClient;
@@ -37,7 +37,7 @@ async fn prove(
     relayer: Address,
     fee: U256,
 ) -> WithdrawProof {
-    let tree = fork.synced_cache(client, pool).await.tree().unwrap();
+    let tree = build_tree(&fork.commitments(client, pool).await).unwrap();
     let leaf = tree.index_of(&note.commitment()).expect("deposit in tree");
     let path = tree.proof(leaf).unwrap();
     assert!(client.is_known_root(pool, path.root_bytes()).await.unwrap());
@@ -63,7 +63,12 @@ async fn connects_and_reads_pool_stats() {
     assert_eq!(client.chain.name, "mainnet");
     for p in client.chain.pools.clone() {
         let count = client.deposit_count(&p).await.unwrap();
-        assert!(count > 0, "{} {} pool has no deposits", p.amount, p.currency);
+        assert!(
+            count > 0,
+            "{} {} pool has no deposits",
+            p.amount,
+            p.currency
+        );
         client.balance_of(&p, p.address).await.unwrap();
     }
     let eth = pool(&client, "eth", "0.1");
@@ -155,13 +160,13 @@ async fn synced_tree_matches_contract_root() {
     let pool = pool(&client, "eth", "0.1");
     let (note, leaf) = deposit(&fork, &pool).await;
 
-    let cache = fork.synced_cache(&client, &pool).await;
+    let commitments = fork.commitments(&client, &pool).await;
     assert_eq!(
-        cache.commitments.len() as u32,
+        commitments.len() as u32,
         client.deposit_count(&pool).await.unwrap()
     );
-    assert_eq!(cache.commitments[leaf as usize], note.commitment_bytes());
-    let tree = cache.tree().unwrap();
+    assert_eq!(commitments[leaf as usize], note.commitment_bytes());
+    let tree = build_tree(&commitments).unwrap();
     assert_eq!(tree.index_of(&note.commitment()), Some(leaf as usize));
     let root = tree.proof(leaf as usize).unwrap().root_bytes();
     assert!(client.is_known_root(&pool, root).await.unwrap());
@@ -206,8 +211,7 @@ async fn relayed_withdraw(fork: &Fork, pool: &Pool) -> (Address, Address, U256) 
     let reader = fork.client(None).await;
     let (note, _) = deposit(fork, pool).await;
     let relayer_key = fork.funded_signer(ether(1)).await;
-    let relayer =
-        MockRelayer::start(&fork.url(), relayer_key, RelayerConfig::default()).await;
+    let relayer = MockRelayer::start(&fork.url(), relayer_key, RelayerConfig::default()).await;
 
     let rc = RelayerClient::new(&relayer.url, None).unwrap();
     let status = rc.status().await.unwrap();
