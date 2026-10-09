@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/tornado-cash-rs", "crates/tornado-cash-rs-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tynes/tornado-cash-rs"
+keywords = ["tornado-cash", "ethereum", "privacy", "zk", "groth16"]
+categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
+
+[workspace.dependencies]
+tornado-cash-rs = { path = "crates/tornado-cash-rs", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+
+# Witness generation and proving are unusably slow without optimizations.
+[profile.dev.package."*"]
+opt-level = 3

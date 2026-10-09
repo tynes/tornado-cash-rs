@@ -1,0 +1,37 @@
+[package]
+name = "tornado-cash-rs"
+description = "Types, proving, Ethereum and relayer clients, and an encrypted note store for Tornado Cash Classic"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+alloy = { version = "1", default-features = false, features = ["std", "providers", "provider-http", "reqwest-rustls-tls", "signers", "signer-local", "sol-types", "contract", "network", "rpc-types", "json"] }
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+ark-poly = "0.5"
+ark-std = "0.5"
+argon2 = "0.5"
+boa_engine = "0.20"
+chacha20poly1305 = "0.10"
+hex = "0.4"
+num-bigint = "0.4"
+rand = "0.8"
+reqwest = { version = "0.13", features = ["json", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+tracing = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
