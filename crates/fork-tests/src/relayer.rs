@@ -12,27 +12,8 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tornado_cash_rs::eth::bindings::ITornadoInstance;
 use tornado_cash_rs::eth::TornadoClient;
-
-mod bindings {
-    #![allow(clippy::too_many_arguments)]
-
-    alloy::sol! {
-        #[sol(rpc)]
-        interface ITornadoInstance {
-            function withdraw(
-                bytes calldata _proof,
-                bytes32 _root,
-                bytes32 _nullifierHash,
-                address _recipient,
-                address _relayer,
-                uint256 _fee,
-                uint256 _refund
-            ) external payable;
-        }
-    }
-}
-use bindings::ITornadoInstance;
 
 /// Values reported by `/status`.
 #[derive(Clone, Debug)]
