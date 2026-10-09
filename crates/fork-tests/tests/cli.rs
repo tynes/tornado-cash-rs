@@ -16,13 +16,6 @@ const PASSWORD: &str = "fork-test-password";
 // Throwaway key, funded on each fork.
 const PRIVATE_KEY: &str = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 
-fn set_secrets() {
-    // The CLI reads its secrets from the environment. Every test sets the
-    // same values, so the order tests run in does not matter.
-    std::env::set_var("TORNADO_PASSWORD", PASSWORD);
-    std::env::set_var("PRIVATE_KEY", PRIVATE_KEY);
-}
-
 fn signer() -> PrivateKeySigner {
     PRIVATE_KEY.parse().unwrap()
 }
@@ -35,6 +28,10 @@ async fn tornado(fork: &Fork, data_dir: &Path, args: &[&str]) -> anyhow::Result<
         data_dir.to_str().unwrap(),
         "--rpc-url",
         &url,
+        "--password",
+        PASSWORD,
+        "--private-key",
+        PRIVATE_KEY,
     ];
     argv.extend_from_slice(args);
     run(Cli::try_parse_from(argv)?).await
@@ -69,7 +66,6 @@ async fn deposit_sync_withdraw_self_relay() {
     let Some(fork) = Fork::spawn().await else {
         return;
     };
-    set_secrets();
     fork.set_balance(signer().address(), ether(1)).await;
     let client = fork.client(None).await;
     let pool = client.chain.pool("eth", "0.1").unwrap().clone();
@@ -132,7 +128,6 @@ async fn import_and_withdraw_through_relayer() {
     let Some(fork) = Fork::spawn().await else {
         return;
     };
-    set_secrets();
     let dir = data_dir(&fork).await;
     let d = dir.path();
     tornado(&fork, d, &["init"]).await.unwrap();

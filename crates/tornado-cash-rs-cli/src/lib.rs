@@ -41,6 +41,32 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 10_000)]
     log_span: u64,
 
+    // Secrets come from the environment (or a prompt when unset). The flags
+    // are hidden so they stay out of help text and shell history.
+    /// Note database password.
+    #[arg(
+        long,
+        global = true,
+        env = "TORNADO_PASSWORD",
+        hide = true,
+        hide_env_values = true
+    )]
+    password: Option<String>,
+
+    /// Key for deposits and self-relayed withdrawals.
+    #[arg(
+        long,
+        global = true,
+        env = "PRIVATE_KEY",
+        hide = true,
+        hide_env_values = true
+    )]
+    private_key: Option<String>,
+
+    /// File holding the private key; takes precedence over PRIVATE_KEY.
+    #[arg(long, global = true, env = "PRIVATE_KEY_FILE")]
+    private_key_file: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -105,6 +131,7 @@ enum NotesCmd {
     /// Import a tornado-cli note string. Checks the chain for its deposit when --rpc-url is set.
     Import {
         /// Read from the TORNADO_NOTE env var or a prompt if omitted, to keep it out of shell history.
+        #[arg(env = "TORNADO_NOTE", hide_env_values = true)]
         note: Option<String>,
         #[arg(long)]
         label: Option<String>,
@@ -116,6 +143,9 @@ struct App {
     rpc_url: Option<String>,
     http: reqwest::Client,
     sync: SyncOptions,
+    password: Option<Zeroizing<String>>,
+    private_key: Option<Zeroizing<String>>,
+    private_key_file: Option<PathBuf>,
 }
 
 impl App {
@@ -137,7 +167,7 @@ impl App {
                 path.display()
             );
         }
-        let pw = password("Database password: ")?;
+        let pw = self.password("Database password: ")?;
         NoteDb::open(&path, &pw).context("opening note database")
     }
 
@@ -184,24 +214,26 @@ impl App {
     }
 }
 
-fn password(prompt: &str) -> Result<Zeroizing<String>> {
-    if let Ok(p) = std::env::var("TORNADO_PASSWORD") {
-        return Ok(Zeroizing::new(p));
+impl App {
+    fn password(&self, prompt: &str) -> Result<Zeroizing<String>> {
+        match &self.password {
+            Some(p) => Ok(p.clone()),
+            None => Ok(Zeroizing::new(rpassword::prompt_password(prompt)?)),
+        }
     }
-    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
-}
 
-fn signer() -> Result<PrivateKeySigner> {
-    let raw = if let Ok(path) = std::env::var("PRIVATE_KEY_FILE") {
-        Zeroizing::new(std::fs::read_to_string(path).context("reading PRIVATE_KEY_FILE")?)
-    } else if let Ok(k) = std::env::var("PRIVATE_KEY") {
-        Zeroizing::new(k)
-    } else {
-        Zeroizing::new(rpassword::prompt_password("Private key: ")?)
-    };
-    raw.trim()
-        .parse::<PrivateKeySigner>()
-        .context("invalid private key")
+    fn signer(&self) -> Result<PrivateKeySigner> {
+        let raw = if let Some(path) = &self.private_key_file {
+            Zeroizing::new(std::fs::read_to_string(path).context("reading PRIVATE_KEY_FILE")?)
+        } else if let Some(k) = &self.private_key {
+            k.clone()
+        } else {
+            Zeroizing::new(rpassword::prompt_password("Private key: ")?)
+        };
+        raw.trim()
+            .parse::<PrivateKeySigner>()
+            .context("invalid private key")
+    }
 }
 
 fn confirm(yes: bool, msg: &str) -> Result<()> {
@@ -238,6 +270,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             max_block_span: cli.log_span,
             ..Default::default()
         },
+        password: cli.password.map(Zeroizing::new),
+        private_key: cli.private_key.map(Zeroizing::new),
+        private_key_file: cli.private_key_file,
     };
 
     match cli.cmd {
@@ -289,9 +324,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 fn init(app: &App) -> Result<()> {
     let path = app.db_path();
-    let pw = match std::env::var("TORNADO_PASSWORD") {
-        Ok(p) => Zeroizing::new(p),
-        Err(_) => {
+    let pw = match &app.password {
+        Some(p) => p.clone(),
+        None => {
             let a = Zeroizing::new(rpassword::prompt_password("New database password: ")?);
             let b = Zeroizing::new(rpassword::prompt_password("Repeat password: ")?);
             if a != b {
@@ -308,7 +343,7 @@ fn init(app: &App) -> Result<()> {
 
 async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<()> {
     let mut db = app.open_db()?;
-    let client = app.client(Some(signer()?)).await?;
+    let client = app.client(Some(app.signer()?)).await?;
     let pool = client.chain.pool(currency, amount)?.clone();
     let from = client.sender()?;
     confirm(
@@ -357,7 +392,11 @@ async fn withdraw(
     let mut db = app.open_db()?;
     // The local status is only a hint; the chain decides whether the note is spent.
     let rec = db.get(id)?.clone();
-    let signer = if self_relay { Some(signer()?) } else { None };
+    let signer = if self_relay {
+        Some(app.signer()?)
+    } else {
+        None
+    };
     let client = app.client(signer).await?;
     if client.chain.chain_id != rec.note.chain_id {
         bail!(
@@ -585,7 +624,7 @@ async fn notes(app: &App, cmd: NotesCmd) -> Result<()> {
             Ok(())
         }
         NotesCmd::Import { note, label } => {
-            let s = match note.or_else(|| std::env::var("TORNADO_NOTE").ok()) {
+            let s = match note {
                 Some(s) => Zeroizing::new(s),
                 None => Zeroizing::new(rpassword::prompt_password("Note: ")?),
             };
