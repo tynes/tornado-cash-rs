@@ -1,3 +1,23 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Derived from snarkjs 0.1.x src/calculateWitness.js and src/bigint.js:
+//   https://github.com/tornadocash/snarkjs/blob/869181cfaf7526fe8972073d31655493a04326d5/src/calculateWitness.js
+//   Copyright 2018 0kims association.
+// Modifications Copyright 2026 the tornado-cash-rs authors.
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option)
+// any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program. If not, see <https://www.gnu.org/licenses/>.
+//
 // Witness calculator for circuits compiled by circom 0.0.x (the JSON format
 // the Tornado Cash Classic withdraw circuit ships in). This is a port of
 // snarkjs 0.1.x `calculateWitness` and its native-BigInt `bigint.js` shim;

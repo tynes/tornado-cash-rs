@@ -8,6 +8,11 @@
 //!
 //! Notes are written *before* their deposit transaction is broadcast, so a
 //! crash between the two cannot lose the secret for funds already sent.
+//!
+//! An open [`NoteDb`] holds an exclusive lock on `<path>.lock` for its whole
+//! lifetime. Every handle reads the full file and writes back its own
+//! snapshot, so two handles open at once could otherwise silently drop each
+//! other's notes; the lock makes a second process fail fast instead.
 
 use crate::chains::{chain_by_id, format_units};
 use crate::error::{Error, Result};
@@ -134,9 +139,40 @@ impl Balance {
 
 pub struct NoteDb {
     path: PathBuf,
+    /// Exclusive lock held until the handle is dropped.
+    _lock: std::fs::File,
     kdf: KdfParams,
     key: Zeroizing<[u8; 32]>,
     contents: Contents,
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+/// Take the database's exclusive lock, failing if another handle holds it.
+fn acquire_lock(path: &Path) -> Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(path))?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Database(format!(
+            "{} is in use by another process; wait for it to finish",
+            path.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 fn now() -> u64 {
@@ -150,19 +186,21 @@ impl NoteDb {
     /// Create a new, empty database. Fails if the file already exists.
     pub fn create(path: impl AsRef<Path>, password: &str) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        if password.is_empty() {
+            return Err(Error::Database("password must not be empty".into()));
+        }
+        let lock = acquire_lock(&path)?;
         if path.exists() {
             return Err(Error::Database(format!(
                 "{} already exists",
                 path.display()
             )));
         }
-        if password.is_empty() {
-            return Err(Error::Database("password must not be empty".into()));
-        }
         let kdf = KdfParams::new_random();
         let key = kdf.derive(password.as_bytes())?;
         let db = NoteDb {
             path,
+            _lock: lock,
             kdf,
             key,
             contents: Contents::default(),
@@ -174,6 +212,13 @@ impl NoteDb {
     /// Open and decrypt an existing database.
     pub fn open(path: impl AsRef<Path>, password: &str) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(Error::Database(format!(
+                "{} does not exist",
+                path.display()
+            )));
+        }
+        let lock = acquire_lock(&path)?;
         let raw = std::fs::read(&path)?;
         let env: Envelope = serde_json::from_slice(&raw)
             .map_err(|_| Error::Database("not a tornado-cash-rs note database".into()))?;
@@ -208,6 +253,7 @@ impl NoteDb {
         let contents: Contents = serde_json::from_slice(&plain)?;
         Ok(NoteDb {
             path,
+            _lock: lock,
             kdf: env.header.kdf,
             key,
             contents,
@@ -412,6 +458,30 @@ mod tests {
         let b = db.balances();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].formatted(), "0.1");
+    }
+
+    #[test]
+    fn second_handle_is_refused_while_first_is_open() {
+        // Regression: two open handles each saved their own snapshot, so the
+        // later save erased notes the other had added.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.db");
+        let pool = address!("12D66f87A04A9E220743712cE6d9bB1B5616B8Fc");
+        drop(NoteDb::create(&path, "pw").unwrap());
+
+        let withdraw = NoteDb::open(&path, "pw").unwrap();
+        let err = NoteDb::open(&path, "pw")
+            .err()
+            .expect("second open must fail");
+        assert!(err.to_string().contains("in use"), "{err}");
+        drop(withdraw);
+
+        let mut deposit = NoteDb::open(&path, "pw").unwrap();
+        deposit
+            .insert(Note::random(1, "eth", "0.1"), pool, NoteStatus::Pending)
+            .unwrap();
+        drop(deposit);
+        assert_eq!(NoteDb::open(&path, "pw").unwrap().notes().len(), 1);
     }
 
     #[test]

@@ -5,8 +5,8 @@ members = ["crates/tornado-cash-rs", "crates/tornado-cash-rs-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+rust-version = "1.91"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/tynes/tornado-cash-rs"
 keywords = ["tornado-cash", "ethereum", "privacy", "zk", "groth16"]
 categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
