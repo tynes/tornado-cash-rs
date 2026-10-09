@@ -69,7 +69,14 @@ impl Artifact {
             return Err(self.err("downloaded file does not match the pinned SHA-256"));
         }
         std::fs::create_dir_all(dir)?;
-        let tmp: PathBuf = dir.join(format!("{}.part", self.file_name));
+        // A unique temp name per writer, so concurrent downloads into the same
+        // directory don't rename each other's file away.
+        let tmp: PathBuf = dir.join(format!(
+            "{}.{}-{:016x}.part",
+            self.file_name,
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, &path)?;
         Ok(bytes)
