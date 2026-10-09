@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/tornado-cash-rs", "crates/tornado-cash-rs-cli"]
+members = ["crates/tornado-cash-rs", "crates/tornado-cash-rs-cli", "crates/fork-tests"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.94.1"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/tynes/tornado-cash-rs"
 keywords = ["tornado-cash", "ethereum", "privacy", "zk", "groth16"]
@@ -20,3 +20,23 @@ lto = "thin"
 # Witness generation and proving are unusably slow without optimizations.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Foundry's own patches at the anvil tag used by crates/fork-tests (git
+# dependencies don't carry them). Only that test crate pulls these packages in.
+[patch.crates-io]
+solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
+solar-cli = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
+solar-lsp = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
+solar-lint = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
+foundry-wallets = { git = "https://github.com/foundry-rs/foundry-core", rev = "39c03a49ade2f74a6e97e2af308283a42d78d302" }
+foundry-compilers = { git = "https://github.com/foundry-rs/foundry-core", rev = "39c03a49ade2f74a6e97e2af308283a42d78d302" }
+foundry-block-explorers = { git = "https://github.com/foundry-rs/foundry-core", rev = "39c03a49ade2f74a6e97e2af308283a42d78d302" }
+foundry-fork-db = { git = "https://github.com/foundry-rs/foundry-core", rev = "39c03a49ade2f74a6e97e2af308283a42d78d302" }
+alloy-op-evm = { git = "https://github.com/foundry-rs/optimism", rev = "206d26cedb9d861b983d89fc71e1122187dfa877" }
+op-alloy-consensus = { git = "https://github.com/foundry-rs/optimism", rev = "206d26cedb9d861b983d89fc71e1122187dfa877" }
+op-alloy-network = { git = "https://github.com/foundry-rs/optimism", rev = "206d26cedb9d861b983d89fc71e1122187dfa877" }
+op-alloy-rpc-types = { git = "https://github.com/foundry-rs/optimism", rev = "206d26cedb9d861b983d89fc71e1122187dfa877" }
+alloy-op-hardforks = { git = "https://github.com/foundry-rs/optimism", rev = "206d26cedb9d861b983d89fc71e1122187dfa877" }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "6ef1f812c9ddcbe90a88ada73944012520942d26" }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "6ef1f812c9ddcbe90a88ada73944012520942d26" }
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "6ef1f812c9ddcbe90a88ada73944012520942d26" }

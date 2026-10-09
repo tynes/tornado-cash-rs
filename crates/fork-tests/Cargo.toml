@@ -1,0 +1,27 @@
+[package]
+name = "tornado-cash-rs-fork-tests"
+description = "Mainnet-fork integration tests for tornado-cash-rs, run against an in-process anvil"
+version.workspace = true
+edition.workspace = true
+# anvil needs a newer compiler than the published crates.
+rust-version = "1.98"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tornado-cash-rs.workspace = true
+alloy = { version = "2", default-features = false, features = ["std", "providers", "signers", "signer-local", "sol-types", "contract", "rpc-types"] }
+# Not on crates.io; this crate is never published. When bumping the tag, copy
+# foundry's [patch.crates-io] for that tag into the workspace Cargo.toml.
+anvil = { git = "https://github.com/foundry-rs/foundry", tag = "v1.8.5" }
+foundry-primitives = { git = "https://github.com/foundry-rs/foundry", tag = "v1.8.5" }
+axum = "0.8"
+reqwest = "0.13"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+
+[dev-dependencies]
+tornado-cash-rs-cli = { path = "../tornado-cash-rs-cli" }
+tempfile = "3"
+anyhow = "1"

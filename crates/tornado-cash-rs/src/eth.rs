@@ -18,7 +18,9 @@ use alloy::transports::http::Http;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-mod bindings {
+/// Contract bindings for the pool and ERC-20 calls this client makes. Public
+/// so other tools (e.g. a relayer) can submit the same calls.
+pub mod bindings {
     #![allow(clippy::too_many_arguments)]
     use alloy::sol;
 

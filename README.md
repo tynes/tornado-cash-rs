@@ -65,7 +65,14 @@ relayers; the CLI warns when you use them.
 ```sh
 cargo test                                   # unit tests
 cargo test --release -- --ignored            # real proof with the trusted-setup key (downloads 34 MB)
+ETH_RPC_URL=https://... cargo test --release -p tornado-cash-rs-fork-tests   # mainnet-fork tests
 ```
+
+The fork tests (`crates/fork-tests`) start an anvil node inside the test process, forked from `ETH_RPC_URL`
+(an archive mainnet endpoint) at a pinned block (`FORK_BLOCK` overrides it). They cover deposits (ETH and DAI), event
+sync against the on-chain root, self-relayed and relayed withdrawals through an in-process mock relayer, and the CLI
+commands end to end. Without `ETH_RPC_URL` they print `skipping` and pass. The first run scans the pools' deposit
+history up to the fork block and caches it under `target/fork-test-cache/` (`FORK_TEST_CACHE` overrides it).
 
 ## License
 
