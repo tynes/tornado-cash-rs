@@ -7,14 +7,16 @@ use crate::hash::fr_from_be_bytes;
 use crate::merkle::MerkleTree;
 use crate::note::Note;
 use crate::prover::WithdrawProof;
-use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
+use alloy::network::{
+    Ethereum, EthereumWallet, NetworkTransactionBuilder, NetworkWallet, TransactionBuilder,
+};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::client::RpcClient;
+use alloy::rpc::client::ClientBuilder;
 use alloy::rpc::types::simulate::{SimBlock, SimulatePayload};
 use alloy::rpc::types::{Filter, TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::http::Http;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -180,6 +182,39 @@ pub fn receipt_withdraws(
             && ITornadoInstance::Withdrawal::decode_log_data(&data)
                 .is_ok_and(|ev| ev.nullifierHash == nullifier_hash)
     })
+}
+
+/// Calldata for the pool's `deposit` call for `note`, for sending from another
+/// wallet such as a Safe. A native-coin pool needs the pool's denomination as
+/// the call's value; an ERC-20 pool needs an [`approve_calldata`] call first.
+pub fn deposit_calldata(note: &Note) -> Bytes {
+    ITornadoInstance::depositCall {
+        _commitment: note.commitment_bytes(),
+    }
+    .abi_encode()
+    .into()
+}
+
+/// Calldata for the pool's `withdraw` call with proof `w`. The call's value
+/// must equal the proof's refund (zero unless a relayer pays one).
+pub fn withdraw_calldata(w: &WithdrawProof) -> Bytes {
+    let a = &w.args;
+    ITornadoInstance::withdrawCall {
+        _proof: Bytes::copy_from_slice(&w.proof_bytes()),
+        _root: a.root,
+        _nullifierHash: a.nullifier_hash,
+        _recipient: a.recipient,
+        _relayer: a.relayer,
+        _fee: a.fee,
+        _refund: a.refund,
+    }
+    .abi_encode()
+    .into()
+}
+
+/// Calldata for an ERC-20 `approve(spender, amount)` call.
+pub fn approve_calldata(spender: Address, amount: U256) -> Bytes {
+    IERC20::approveCall { spender, amount }.abi_encode().into()
 }
 
 /// The `approve` calls needed to raise `allowance` to `needed`. Tokens like
@@ -388,11 +423,25 @@ impl TornadoClient {
         signer: Option<PrivateKeySigner>,
         http: Option<reqwest::Client>,
     ) -> Result<Self> {
+        Self::connect_with_wallet(rpc_url, signer.map(EthereumWallet::from), http).await
+    }
+
+    /// Like [`connect`](Self::connect), but with any wallet, such as one
+    /// backed by a hardware signer. Transactions are sent from the wallet's
+    /// default signer.
+    pub async fn connect_with_wallet(
+        rpc_url: &str,
+        wallet: Option<EthereumWallet>,
+        http: Option<reqwest::Client>,
+    ) -> Result<Self> {
         let url: reqwest::Url = rpc_url.parse().map_err(eth_err)?;
-        let transport = Http::with_client(http.unwrap_or_default(), url);
-        let client = RpcClient::new(transport, false);
-        let sender = signer.as_ref().map(|s| s.address());
-        let wallet = signer.map(EthereumWallet::from);
+        let transport = Http::with_client(http.unwrap_or_default(), url.clone());
+        let client = ClientBuilder::default()
+            .layer(crate::net::RpcLogLayer::new(&url))
+            .transport(transport, false);
+        let sender = wallet
+            .as_ref()
+            .map(NetworkWallet::<Ethereum>::default_signer_address);
         let provider: DynProvider = match &wallet {
             Some(w) => ProviderBuilder::new()
                 .wallet(w.clone())
@@ -923,5 +972,14 @@ mod tests {
             approvals_needed(U256::from(50u64), need),
             vec![U256::ZERO, need]
         );
+    }
+
+    #[test]
+    fn deposit_calldata_encodes_the_commitment() {
+        let note = Note::random(1, "eth", "0.1");
+        let data = deposit_calldata(&note);
+        assert_eq!(data[..4], ITornadoInstance::depositCall::SELECTOR);
+        let call = ITornadoInstance::depositCall::abi_decode(&data).unwrap();
+        assert_eq!(call._commitment, note.commitment_bytes());
     }
 }

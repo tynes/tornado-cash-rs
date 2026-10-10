@@ -3,7 +3,9 @@
 //! The binary is a thin wrapper around [`run`], which lets tests drive the CLI
 //! in-process.
 
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
+use alloy::signers::ledger::{HDPath, LedgerSigner};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{bail, Context, Result};
 pub use clap::Parser;
@@ -13,7 +15,9 @@ use std::path::PathBuf;
 use tornado_cash_rs::chains::{all_chains, chain_by_id, format_units, parse_units, Tier};
 use tornado_cash_rs::db::{NoteDb, NoteStatus};
 use tornado_cash_rs::error::Error;
-use tornado_cash_rs::eth::{build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient};
+use tornado_cash_rs::eth::{
+    self, build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient,
+};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::Prover;
 use tornado_cash_rs::relayer::RelayerClient;
@@ -26,7 +30,8 @@ use zeroize::Zeroizing;
     about = "Deposit to and withdraw from Tornado Cash Classic pools"
 )]
 pub struct Cli {
-    /// Directory for the note database, event cache and proving artifacts.
+    /// Directory for the note database, event cache and proving artifacts
+    /// [default: ~/.tornado-cash-rs].
     #[arg(long, global = true, env = "TORNADO_RS_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
@@ -37,6 +42,19 @@ pub struct Cli {
     /// Route RPC, relayer and artifact traffic through a proxy, e.g. socks5h://127.0.0.1:9050 for Tor.
     #[arg(long, global = true, env = "TORNADO_RS_PROXY")]
     proxy: Option<String>,
+
+    /// Log every network request to stderr: what it is, where it goes, status, size and time.
+    /// `full` also logs request and response bodies (addresses, proofs, signed transactions).
+    #[arg(
+        long,
+        global = true,
+        env = "TORNADO_RS_LOG_NETWORK",
+        value_name = "DETAIL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "summary"
+    )]
+    log_network: Option<NetLog>,
 
     /// Maximum block range per eth_getLogs request.
     #[arg(long, global = true, default_value_t = 10_000)]
@@ -68,8 +86,44 @@ pub struct Cli {
     #[arg(long, global = true, env = "PRIVATE_KEY_FILE")]
     private_key_file: Option<PathBuf>,
 
+    /// Sign with a Ledger hardware wallet instead of a private key.
+    #[arg(long, global = true, env = "TORNADO_RS_LEDGER")]
+    ledger: bool,
+
+    /// Ledger Live account index to sign with (path m/44'/60'/<index>'/0/0).
+    #[arg(long, global = true, default_value_t = 0, requires = "ledger")]
+    ledger_index: usize,
+
+    /// Full derivation path for the Ledger account, e.g. m/44'/60'/0'/0 for legacy MEW/MyCrypto accounts.
+    #[arg(
+        long,
+        global = true,
+        requires = "ledger",
+        conflicts_with = "ledger_index"
+    )]
+    hd_path: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum NetLog {
+    /// One line per request.
+    Summary,
+    /// Request and response bodies as well.
+    Full,
+}
+
+impl Cli {
+    /// The tracing directive `--log-network` asks for, if any.
+    pub fn network_log_directive(&self) -> Option<String> {
+        let level = match self.log_network? {
+            NetLog::Summary => "info",
+            NetLog::Full => "trace",
+        };
+        Some(format!("{}={level}", tornado_cash_rs::net::TARGET))
+    }
 }
 
 #[derive(Subcommand)]
@@ -83,16 +137,20 @@ enum Cmd {
         /// Send without asking for confirmation (required when stdin is not a terminal).
         #[arg(long, short)]
         yes: bool,
+        /// Save the note as pending and print the deposit calldata instead of sending
+        /// it, e.g. for a Safe. The pool address and value go to stderr.
+        #[arg(long)]
+        calldata: bool,
     },
     /// Withdraw a note to a recipient, through a relayer or from your own account.
     Withdraw {
         /// Note id (or unique prefix) from `notes list`.
         id: String,
         recipient: Address,
-        /// Relayer URL. Without it you must pass --self-relay.
+        /// Relayer URL. Without it you must pass --self-relay or --calldata.
         #[arg(long)]
         relayer: Option<String>,
-        /// Send the withdrawal from PRIVATE_KEY's account (links that account to the withdrawal).
+        /// Send the withdrawal from your own account (PRIVATE_KEY or --ledger) (links that account to the withdrawal).
         #[arg(long, conflicts_with = "relayer")]
         self_relay: bool,
         /// ERC-20 pools only: native coin the relayer should send the recipient, e.g. 0.01.
@@ -101,6 +159,10 @@ enum Cmd {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+        /// Print the withdrawal calldata for another account (e.g. a Safe) to send
+        /// instead of sending it. The pool address and value go to stderr.
+        #[arg(long, conflicts_with_all = ["relayer", "self_relay", "refund"])]
+        calldata: bool,
     },
     /// Show balances from the local note database.
     Balances {
@@ -147,6 +209,7 @@ struct App {
     password: Option<Zeroizing<String>>,
     private_key: Option<Zeroizing<String>>,
     private_key_file: Option<PathBuf>,
+    ledger: Option<HDPath>,
 }
 
 impl App {
@@ -172,12 +235,12 @@ impl App {
         NoteDb::open(&path, &pw).context("opening note database")
     }
 
-    async fn client(&self, signer: Option<PrivateKeySigner>) -> Result<TornadoClient> {
+    async fn client(&self, signer: Option<EthereumWallet>) -> Result<TornadoClient> {
         let url = self
             .rpc_url
             .as_deref()
             .context("set --rpc-url or ETH_RPC_URL")?;
-        let c = TornadoClient::connect(url, signer, Some(self.http.clone())).await?;
+        let c = TornadoClient::connect_with_wallet(url, signer, Some(self.http.clone())).await?;
         if c.chain.tier == Tier::Secondary {
             eprintln!(
                 "warning: {} has small anonymity sets and few relayers; mainnet gives far better privacy",
@@ -223,7 +286,24 @@ impl App {
         }
     }
 
-    fn signer(&self) -> Result<PrivateKeySigner> {
+    /// The wallet for deposits and self-relayed withdrawals: the Ledger when
+    /// --ledger is set, otherwise the private key.
+    async fn signer(&self) -> Result<EthereumWallet> {
+        if let Some(path) = &self.ledger {
+            // The chain id comes from each transaction. The HID transport
+            // panics when USB is unavailable, so contain that in a task.
+            let ledger = tokio::spawn(LedgerSigner::new(path.clone(), None))
+                .await
+                .map_err(|_| anyhow::anyhow!("could not open USB HID to look for a Ledger"))?
+                .context(
+                    "connecting to the Ledger; is it plugged in, unlocked, and on the Ethereum app?",
+                )?;
+            eprintln!(
+                "Using Ledger account {} ({path}); confirm each transaction on the device",
+                alloy::signers::Signer::address(&ledger)
+            );
+            return Ok(EthereumWallet::from(ledger));
+        }
         let raw = if let Some(path) = &self.private_key_file {
             Zeroizing::new(std::fs::read_to_string(path).context("reading PRIVATE_KEY_FILE")?)
         } else if let Some(k) = &self.private_key {
@@ -233,6 +313,7 @@ impl App {
         };
         raw.trim()
             .parse::<PrivateKeySigner>()
+            .map(EthereumWallet::from)
             .context("invalid private key")
     }
 }
@@ -281,18 +362,66 @@ fn gwei(wei: u128) -> String {
     approx_units(U256::from(wei), 9)
 }
 
+/// Say where requests will physically go, since the per-request log lines
+/// show only their final destination.
+fn log_route(proxy: Option<&str>) {
+    use tornado_cash_rs::net::{redact_url, TARGET};
+    match proxy {
+        Some(p) => {
+            let shown = p.parse().map(|u| redact_url(&u)).unwrap_or_default();
+            let dns = if p.starts_with("socks5://") || p.starts_with("socks4://") {
+                "hostnames are resolved locally by the system resolver (use socks5h:// to resolve through the proxy)"
+            } else {
+                "the proxy resolves hostnames"
+            };
+            tracing::info!(target: TARGET, "all requests go through proxy {shown}; {dns}");
+        }
+        None => {
+            // Without --proxy, reqwest picks up the standard proxy variables.
+            let env: Vec<String> = [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .iter()
+            .filter_map(|k| {
+                let v = std::env::var(k).ok().filter(|v| !v.is_empty())?;
+                let shown = v.parse().map(|u| redact_url(&u)).unwrap_or_default();
+                Some(format!("{k}={shown}"))
+            })
+            .collect();
+            if env.is_empty() {
+                tracing::info!(
+                    target: TARGET,
+                    "no proxy: requests connect directly and hostnames are resolved by the system resolver"
+                );
+            } else {
+                tracing::info!(
+                    target: TARGET,
+                    "no --proxy, but requests use the proxy from {} (hosts in NO_PROXY connect directly)",
+                    env.join(", ")
+                );
+            }
+        }
+    }
+}
+
 /// Run one `tornado-rs` command.
 pub async fn run(cli: Cli) -> Result<()> {
     let data_dir = match cli.data_dir {
         Some(d) => d,
-        None => dirs::data_dir()
-            .context("no data directory; pass --data-dir")?
-            .join("tornado-cash-rs"),
+        None => dirs::home_dir()
+            .context("no home directory; pass --data-dir")?
+            .join(".tornado-cash-rs"),
     };
     let mut http = reqwest::Client::builder();
     if let Some(p) = &cli.proxy {
         http = http.proxy(reqwest::Proxy::all(p).context("invalid --proxy")?);
     }
+    log_route(cli.proxy.as_deref());
     let app = App {
         data_dir,
         rpc_url: cli.rpc_url,
@@ -304,6 +433,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         password: cli.password.map(Zeroizing::new),
         private_key: cli.private_key.map(Zeroizing::new),
         private_key_file: cli.private_key_file,
+        ledger: cli.ledger.then_some(match cli.hd_path {
+            Some(p) => HDPath::Other(p),
+            None => HDPath::LedgerLive(cli.ledger_index),
+        }),
     };
 
     match cli.cmd {
@@ -311,7 +444,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Deposit {
             currency,
             amount,
+            yes: _,
+            calldata: true,
+        } => deposit_calldata(&app, &currency, &amount).await,
+        Cmd::Deposit {
+            currency,
+            amount,
             yes,
+            calldata: false,
         } => deposit(&app, &currency, &amount, yes).await,
         Cmd::Withdraw {
             id,
@@ -320,7 +460,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             self_relay,
             refund,
             yes,
-        } => withdraw(&app, &id, recipient, relayer, self_relay, refund, yes).await,
+            calldata,
+        } => {
+            withdraw(
+                &app, &id, recipient, relayer, self_relay, refund, yes, calldata,
+            )
+            .await
+        }
         Cmd::Balances { check } => balances(&app, check).await,
         Cmd::Notes(n) => notes(&app, n).await,
         Cmd::Sync { currency, amount } => {
@@ -374,7 +520,7 @@ fn init(app: &App) -> Result<()> {
 
 async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<()> {
     let mut db = app.open_db()?;
-    let client = app.client(Some(app.signer()?)).await?;
+    let client = app.client(Some(app.signer().await?)).await?;
     let pool = client.chain.pool(currency, amount)?.clone();
     let from = client.sender()?;
     let coin = client.chain.native_symbol;
@@ -450,6 +596,43 @@ async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<(
     Ok(())
 }
 
+/// Generate and save a note, then print the calldata for depositing it from
+/// another account. The note stays pending until `balances --check` finds the
+/// deposit on-chain.
+async fn deposit_calldata(app: &App, currency: &str, amount: &str) -> Result<()> {
+    let mut db = app.open_db()?;
+    let client = app.client(None).await?;
+    let pool = client.chain.pool(currency, amount)?.clone();
+    let note = Note::random(client.chain.chain_id, pool.currency, pool.amount);
+    // The other account may send the call much later, so the note must be
+    // saved before the calldata is handed out.
+    let id = db.insert(note.clone(), pool.address, NoteStatus::Pending)?;
+    eprintln!("Saved note {id} to the database as pending");
+    let denomination = pool.denomination();
+    if let Some(token) = pool.token {
+        eprintln!(
+            "First approve the pool to spend {} {}: to {token}, value 0, data {}",
+            pool.amount,
+            pool.currency.to_uppercase(),
+            eth::approve_calldata(pool.address, denomination)
+        );
+        eprintln!("(Tokens like USDT need the allowance set to 0 before a new approval.)");
+        eprintln!("Then send the deposit: to {}, value 0", pool.address);
+    } else {
+        eprintln!(
+            "Send the deposit: to {}, value {denomination} wei ({} {})",
+            pool.address,
+            pool.amount,
+            pool.currency.to_uppercase()
+        );
+    }
+    eprintln!("Once it is mined, run `tornado-rs balances --check` to mark the note deposited.");
+    eprintln!("Back up the note with `tornado-rs notes export {id}` and keep it secret.");
+    println!("{}", eth::deposit_calldata(&note));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn withdraw(
     app: &App,
     id: &str,
@@ -458,15 +641,16 @@ async fn withdraw(
     self_relay: bool,
     refund: Option<String>,
     yes: bool,
+    calldata: bool,
 ) -> Result<()> {
-    if relayer.is_none() && !self_relay {
-        bail!("pass --relayer <url>, or --self-relay to pay gas from your own account (which links it to this withdrawal)");
+    if relayer.is_none() && !self_relay && !calldata {
+        bail!("pass --relayer <url>, --self-relay to pay gas from your own account (which links it to this withdrawal), or --calldata to print the call for another account to send");
     }
     let mut db = app.open_db()?;
     // The local status is only a hint; the chain decides whether the note is spent.
     let rec = db.get(id)?.clone();
     let signer = if self_relay {
-        Some(app.signer()?)
+        Some(app.signer().await?)
     } else {
         None
     };
@@ -514,6 +698,30 @@ async fn withdraw(
 
     eprintln!("Loading proving key...");
     let prover = Prover::load(&app.artifacts_dir(), Some(app.http.clone())).await?;
+
+    if calldata {
+        eprintln!("Generating proof...");
+        let proof = prover.prove_withdrawal(
+            &rec.note,
+            &path,
+            recipient,
+            Address::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        )?;
+        eprintln!(
+            "Send the withdrawal of {} {} to {recipient}: to {}, value 0",
+            pool.amount,
+            pool.currency.to_uppercase(),
+            pool.address
+        );
+        eprintln!(
+            "Once it is mined, run `tornado-rs balances --check` to mark note {} spent.",
+            rec.id
+        );
+        println!("{}", eth::withdraw_calldata(&proof));
+        return Ok(());
+    }
 
     let tx = if let Some(url) = relayer {
         let rc = RelayerClient::new(&url, Some(app.http.clone()))?;

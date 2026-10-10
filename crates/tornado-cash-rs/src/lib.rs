@@ -6,6 +6,7 @@
 //!   trusted-setup proving key, self-checked against the on-chain verifier key
 //! * [`eth`]: deposits, withdrawals and event sync over JSON-RPC
 //! * [`relayer`]: the Tornado relayer HTTP API
+//! * [`net`]: logging for every outbound request
 //! * [`db`]: a password-encrypted local note database
 //! * [`chains`]: deployment table
 
@@ -15,6 +16,7 @@ pub mod error;
 pub mod eth;
 pub mod hash;
 pub mod merkle;
+pub mod net;
 pub mod note;
 pub mod prover;
 pub mod relayer;

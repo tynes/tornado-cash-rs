@@ -16,12 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 tornado-cash-rs.workspace = true
-alloy = { version = "2", default-features = false, features = ["std", "signers", "signer-local"] }
+alloy = { version = "2", default-features = false, features = ["std", "signers", "signer-local", "signer-ledger", "network"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 reqwest = { version = "0.13", features = ["socks"] }
 rpassword = "7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1"

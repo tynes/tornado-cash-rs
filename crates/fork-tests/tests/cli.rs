@@ -7,7 +7,7 @@ use alloy::signers::local::PrivateKeySigner;
 use std::io::IsTerminal;
 use std::path::Path;
 use tornado_cash_rs::db::{NoteDb, NoteRecord, NoteStatus};
-use tornado_cash_rs::eth::DepositCache;
+use tornado_cash_rs::eth::{deposit_calldata, DepositCache};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs_cli::{run, Cli, Parser};
 use tornado_cash_rs_fork_tests::relayer::{MockRelayer, RelayerConfig};
@@ -122,6 +122,60 @@ async fn deposit_sync_withdraw_self_relay() {
 
     tornado(&fork, d, &["balances", "--check"]).await.unwrap();
     tornado(&fork, d, &["stats"]).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn calldata_mode_saves_pending_note_and_sends_nothing() {
+    let Some(fork) = Fork::spawn().await else {
+        return;
+    };
+    // No balance: calldata mode must not need a funded key.
+    let client = fork.client(None).await;
+    let pool = client.chain.pool("eth", "0.1").unwrap().clone();
+    let dir = data_dir(&fork).await;
+    let d = dir.path();
+    tornado(&fork, d, &["init"]).await.unwrap();
+
+    let next = client.deposit_count(&pool).await.unwrap();
+    tornado(&fork, d, &["deposit", "eth", "0.1", "--calldata"])
+        .await
+        .unwrap();
+    let rec = notes(d).pop().unwrap();
+    assert_eq!(rec.status, NoteStatus::Pending);
+    assert!(rec.deposit_tx.is_none());
+    assert_eq!(client.deposit_count(&pool).await.unwrap(), next);
+
+    // Another account (standing in for a Safe) sends the deposit later.
+    assert!(
+        fork.send_call(
+            pool.address,
+            pool.denomination(),
+            deposit_calldata(&rec.note)
+        )
+        .await
+    );
+    tornado(&fork, d, &["balances", "--check"]).await.unwrap();
+    let rec = notes(d).pop().unwrap();
+    assert_eq!(rec.status, NoteStatus::Deposited);
+    assert_eq!(rec.leaf_index, Some(next));
+
+    let recipient = Address::random();
+    let to = recipient.to_string();
+    tornado(&fork, d, &["withdraw", &rec.id, &to, "--calldata"])
+        .await
+        .unwrap();
+    // Nothing was sent, so the note is still unspent.
+    assert_eq!(notes(d).pop().unwrap().status, NoteStatus::Deposited);
+    assert_eq!(fork.balance(recipient).await, U256::ZERO);
+
+    let err = tornado(
+        &fork,
+        d,
+        &["withdraw", &rec.id, &to, "--calldata", "--self-relay"],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("cannot be used with"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
