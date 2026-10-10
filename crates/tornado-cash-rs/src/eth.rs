@@ -7,11 +7,14 @@ use crate::hash::fr_from_be_bytes;
 use crate::merkle::MerkleTree;
 use crate::note::Note;
 use crate::prover::WithdrawProof;
-use alloy::network::{Ethereum, EthereumWallet, NetworkWallet};
+use alloy::network::{
+    Ethereum, EthereumWallet, NetworkTransactionBuilder, NetworkWallet, TransactionBuilder,
+};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::client::ClientBuilder;
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::simulate::{SimBlock, SimulatePayload};
+use alloy::rpc::types::{Filter, TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::http::Http;
@@ -66,6 +69,72 @@ pub struct DepositReceipt {
     pub tx_hash: B256,
     pub block_number: u64,
     pub leaf_index: u32,
+    /// Gas used by the deposit and any ERC-20 approvals sent before it.
+    pub gas_used: u64,
+    /// What those transactions cost, in the chain's native coin's base units.
+    pub fee: U256,
+}
+
+/// Prices a transaction will be sent with.
+#[derive(Clone, Copy, Debug)]
+pub struct GasFees {
+    /// Expected price per gas (base fee plus tip, or the legacy gas price).
+    pub gas_price: u128,
+    /// Most a transaction may pay per gas. Equals `gas_price` on chains
+    /// without EIP-1559.
+    pub max_fee_per_gas: u128,
+    /// `None` on chains without EIP-1559.
+    pub max_priority_fee_per_gas: Option<u128>,
+}
+
+/// What a deposit is expected to cost, worked out before anything is sent.
+#[derive(Clone, Debug)]
+pub struct DepositEstimate {
+    /// Gas for each ERC-20 approval sent before the deposit (empty for
+    /// native pools and tokens that are already approved).
+    pub approval_gas: Vec<u64>,
+    pub deposit_gas: u64,
+    pub fees: GasFees,
+}
+
+impl DepositEstimate {
+    /// Total gas across the approvals and the deposit.
+    pub fn gas(&self) -> u64 {
+        self.approval_gas.iter().sum::<u64>() + self.deposit_gas
+    }
+
+    /// Expected fee in the native coin's base units.
+    pub fn fee(&self) -> U256 {
+        U256::from(self.gas()) * U256::from(self.fees.gas_price)
+    }
+
+    /// Fee if every transaction paid its max fee per gas.
+    pub fn max_fee(&self) -> U256 {
+        U256::from(self.gas()) * U256::from(self.fees.max_fee_per_gas)
+    }
+}
+
+/// Gas and fee prices for one transaction, estimated before it is sent.
+#[derive(Clone, Copy, Debug)]
+pub struct TxEstimate {
+    pub gas: u64,
+    pub fees: GasFees,
+}
+
+impl TxEstimate {
+    /// Expected fee in the native coin's base units.
+    pub fn fee(&self) -> U256 {
+        U256::from(self.gas) * U256::from(self.fees.gas_price)
+    }
+
+    /// Fee if the transaction paid its max fee per gas.
+    pub fn max_fee(&self) -> U256 {
+        U256::from(self.gas) * U256::from(self.fees.max_fee_per_gas)
+    }
+}
+
+fn receipt_fee(r: &TransactionReceipt) -> U256 {
+    U256::from(r.gas_used) * U256::from(r.effective_gas_price)
 }
 
 /// Locally cached deposit commitments for one pool, ordered by leaf index.
@@ -362,6 +431,7 @@ pub struct TornadoClient {
     provider: DynProvider,
     pub chain: Chain,
     sender: Option<Address>,
+    wallet: Option<EthereumWallet>,
 }
 
 impl TornadoClient {
@@ -391,9 +461,9 @@ impl TornadoClient {
         let sender = wallet
             .as_ref()
             .map(NetworkWallet::<Ethereum>::default_signer_address);
-        let provider: DynProvider = match wallet {
+        let provider: DynProvider = match &wallet {
             Some(w) => ProviderBuilder::new()
-                .wallet(w)
+                .wallet(w.clone())
                 .connect_client(client)
                 .erased(),
             None => ProviderBuilder::new().connect_client(client).erased(),
@@ -404,6 +474,7 @@ impl TornadoClient {
             provider,
             chain,
             sender,
+            wallet,
         })
     }
 
@@ -436,51 +507,203 @@ impl TornadoClient {
         self.provider.get_gas_price().await.map_err(eth_err)
     }
 
-    /// Send the deposit for `note` into `pool` and wait for it to be mined.
-    /// For ERC-20 pools this first approves the pool if needed.
-    pub async fn deposit(&self, pool: &Pool, note: &Note) -> Result<DepositReceipt> {
-        let from = self.sender()?;
-        let denomination = pool.denomination();
-        let have = self.balance_of(pool, from).await?;
-        if have < denomination {
+    /// Current fee prices: EIP-1559 where the chain supports it, else the
+    /// legacy gas price.
+    pub async fn fees(&self) -> Result<GasFees> {
+        let gas_price = self.gas_price().await?;
+        Ok(match self.provider.estimate_eip1559_fees().await {
+            Ok(f) => GasFees {
+                gas_price: gas_price.min(f.max_fee_per_gas),
+                max_fee_per_gas: f.max_fee_per_gas,
+                max_priority_fee_per_gas: Some(f.max_priority_fee_per_gas),
+            },
+            Err(_) => GasFees {
+                gas_price,
+                max_fee_per_gas: gas_price,
+                max_priority_fee_per_gas: None,
+            },
+        })
+    }
+
+    async fn check_deposit_balance(&self, pool: &Pool, from: Address) -> Result<()> {
+        if self.balance_of(pool, from).await? < pool.denomination() {
             return Err(Error::Eth(format!(
                 "insufficient {} balance in {from}",
                 pool.currency.to_uppercase()
             )));
         }
+        Ok(())
+    }
+
+    /// Approvals `from` must send before depositing into a token pool.
+    async fn deposit_approvals(&self, pool: &Pool, from: Address) -> Result<Vec<U256>> {
+        let Some(token) = pool.token else {
+            return Ok(vec![]);
+        };
+        let allowance = IERC20::new(token, &self.provider)
+            .allowance(from, pool.address)
+            .call()
+            .await
+            .map_err(eth_err)?;
+        Ok(approvals_needed(allowance, pool.denomination()))
+    }
+
+    fn deposit_request(&self, pool: &Pool, note: &Note, from: Address) -> TransactionRequest {
+        let instance = ITornadoInstance::new(pool.address, &self.provider);
+        let mut call = instance.deposit(note.commitment_bytes()).from(from);
+        if pool.is_native() {
+            call = call.value(pool.denomination());
+        }
+        call.into_transaction_request()
+    }
+
+    /// Estimate the gas and fee of depositing `note` into `pool`, including
+    /// any ERC-20 approvals it needs first. Sends nothing.
+    pub async fn estimate_deposit(&self, pool: &Pool, note: &Note) -> Result<DepositEstimate> {
+        let from = self.sender()?;
+        self.check_deposit_balance(pool, from).await?;
+        let approvals = self.deposit_approvals(pool, from).await?;
+        let deposit = self.deposit_request(pool, note, from);
+        let fees = self.fees().await?;
+        let Some(token) = pool.token.filter(|_| !approvals.is_empty()) else {
+            let deposit_gas = self.provider.estimate_gas(deposit).await.map_err(eth_err)?;
+            return Ok(DepositEstimate {
+                approval_gas: vec![],
+                deposit_gas,
+                fees,
+            });
+        };
+        // The deposit reverts until the approvals land, so simulate them in order.
+        let erc20 = IERC20::new(token, &self.provider);
+        let mut calls: Vec<TransactionRequest> = approvals
+            .iter()
+            .map(|a| {
+                erc20
+                    .approve(pool.address, *a)
+                    .from(from)
+                    .into_transaction_request()
+            })
+            .collect();
+        calls.push(deposit);
+        let n = calls.len();
+        let payload = SimulatePayload {
+            block_state_calls: vec![SimBlock {
+                calls,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let results: Vec<_> = self
+            .provider
+            .simulate(&payload)
+            .await
+            .map_err(|e| Error::Eth(format!("simulating approval and deposit: {e}")))?
+            .into_iter()
+            .flat_map(|b| b.calls)
+            .collect();
+        if results.len() != n || results.iter().any(|c| !c.status) {
+            return Err(Error::Eth("approval and deposit fail in simulation".into()));
+        }
+        let mut gas: Vec<u64> = results.iter().map(|c| c.gas_used).collect();
+        let deposit_gas = gas.pop().expect("deposit simulated");
+        Ok(DepositEstimate {
+            approval_gas: gas,
+            deposit_gas,
+            fees,
+        })
+    }
+
+    /// Send the deposit for `note` into `pool` and wait for it to be mined.
+    /// ERC-20 pools are approved first if needed.
+    pub async fn deposit(&self, pool: &Pool, note: &Note) -> Result<DepositReceipt> {
+        self.deposit_with(pool, note, |_| Ok(())).await
+    }
+
+    /// Like [`deposit`](Self::deposit), but calls `before_send` with the
+    /// deposit's transaction hash after it is signed and before it is
+    /// broadcast, so the caller can save the note first. Errors before that
+    /// call mean nothing was deposited. [`Error::NotDeposited`] after it means
+    /// the deposit was definitely not made; any other error means it may
+    /// still be mined.
+    pub async fn deposit_with(
+        &self,
+        pool: &Pool,
+        note: &Note,
+        before_send: impl FnOnce(B256) -> Result<()>,
+    ) -> Result<DepositReceipt> {
+        let from = self.sender()?;
+        let wallet = self.wallet.as_ref().expect("a sender has a wallet");
+        self.check_deposit_balance(pool, from).await?;
+        let mut gas_used = 0;
+        let mut fee = U256::ZERO;
         if let Some(token) = pool.token {
             let erc20 = IERC20::new(token, &self.provider);
-            let allowance = erc20
-                .allowance(from, pool.address)
-                .call()
-                .await
-                .map_err(eth_err)?;
-            for amount in approvals_needed(allowance, denomination) {
+            for amount in self.deposit_approvals(pool, from).await? {
                 let pending = erc20
                     .approve(pool.address, amount)
                     .send()
                     .await
                     .map_err(eth_err)?;
                 let r = pending.get_receipt().await.map_err(eth_err)?;
+                gas_used += r.gas_used;
+                fee += receipt_fee(&r);
                 if !r.status() {
                     return Err(Error::Eth("approve transaction reverted".into()));
                 }
             }
         }
-        let instance = ITornadoInstance::new(pool.address, &self.provider);
-        let commitment = note.commitment_bytes();
-        let mut call = instance.deposit(commitment);
-        if pool.is_native() {
-            call = call.value(denomination);
-        }
-        let pending = call.send().await.map_err(eth_err)?;
-        let tx_hash = *pending.tx_hash();
+
+        // Sign here rather than through the provider so the hash is known
+        // before the transaction leaves this process.
+        let mut tx = self.deposit_request(pool, note, from);
+        let gas = self
+            .provider
+            .estimate_gas(tx.clone())
+            .await
+            .map_err(eth_err)?;
+        let nonce = self
+            .provider
+            .get_transaction_count(from)
+            .pending()
+            .await
+            .map_err(eth_err)?;
+        let fees = self.fees().await?;
+        tx = tx
+            .with_gas_limit(gas)
+            .with_nonce(nonce)
+            .with_chain_id(self.chain.chain_id);
+        tx = match fees.max_priority_fee_per_gas {
+            Some(tip) => tx
+                .with_max_fee_per_gas(fees.max_fee_per_gas)
+                .with_max_priority_fee_per_gas(tip),
+            None => tx.with_gas_price(fees.gas_price),
+        };
+        let envelope = tx.build(wallet).await.map_err(eth_err)?;
+        let tx_hash = *envelope.tx_hash();
+        before_send(tx_hash)?;
+
+        let pending = match self.provider.send_tx_envelope(envelope).await {
+            Ok(p) => p,
+            // The node may have taken the transaction even though the call
+            // failed (a timeout, say); only a node that never saw it is proof.
+            Err(e) => {
+                return Err(match self.provider.get_transaction_by_hash(tx_hash).await {
+                    Ok(None) => Error::NotDeposited(format!("sending the deposit failed: {e}")),
+                    _ => Error::Eth(format!(
+                        "sending deposit {tx_hash:#x} failed ({e}); it may still be mined"
+                    )),
+                });
+            }
+        };
         let receipt = pending.get_receipt().await.map_err(eth_err)?;
+        gas_used += receipt.gas_used;
+        fee += receipt_fee(&receipt);
         if !receipt.status() {
-            return Err(Error::Eth(format!(
+            return Err(Error::NotDeposited(format!(
                 "deposit transaction {tx_hash:#x} reverted"
             )));
         }
+        let commitment = note.commitment_bytes();
         let leaf_index = receipt
             .inner
             .logs()
@@ -494,6 +717,8 @@ impl TornadoClient {
             tx_hash,
             block_number: receipt.block_number.unwrap_or_default(),
             leaf_index,
+            gas_used,
+            fee,
         })
     }
 
@@ -561,12 +786,15 @@ impl TornadoClient {
         Ok(())
     }
 
-    /// Submit a withdrawal from this client's own account.
-    pub async fn withdraw(&self, pool: &Pool, w: &WithdrawProof) -> Result<B256> {
-        self.sender()?;
+    fn withdraw_request(
+        &self,
+        pool: &Pool,
+        w: &WithdrawProof,
+        from: Address,
+    ) -> TransactionRequest {
         let a = &w.args;
         let instance = ITornadoInstance::new(pool.address, &self.provider);
-        let call = instance
+        instance
             .withdraw(
                 Bytes::copy_from_slice(&w.proof_bytes()),
                 a.root,
@@ -576,14 +804,44 @@ impl TornadoClient {
                 a.fee,
                 a.refund,
             )
-            .value(a.refund);
-        let pending = call.send().await.map_err(eth_err)?;
+            .value(a.refund)
+            .from(from)
+            .into_transaction_request()
+    }
+
+    /// Estimate the gas and fee of sending withdrawal `w` from this client's
+    /// own account. Sends nothing.
+    pub async fn estimate_withdraw(&self, pool: &Pool, w: &WithdrawProof) -> Result<TxEstimate> {
+        let tx = self.withdraw_request(pool, w, self.sender()?);
+        let gas = self.provider.estimate_gas(tx).await.map_err(eth_err)?;
+        Ok(TxEstimate {
+            gas,
+            fees: self.fees().await?,
+        })
+    }
+
+    /// Submit a withdrawal from this client's own account.
+    pub async fn withdraw(&self, pool: &Pool, w: &WithdrawProof) -> Result<B256> {
+        let tx = self.withdraw_request(pool, w, self.sender()?);
+        let pending = self.provider.send_transaction(tx).await.map_err(eth_err)?;
         let tx = *pending.tx_hash();
         let r = pending.get_receipt().await.map_err(eth_err)?;
         if !r.status() {
             return Err(Error::Eth(format!("withdraw transaction {tx:#x} reverted")));
         }
         Ok(tx)
+    }
+
+    /// Gas used by mined transaction `tx` and the fee it paid, in the native
+    /// coin's base units.
+    pub async fn tx_cost(&self, tx: B256) -> Result<(u64, U256)> {
+        let r = self
+            .provider
+            .get_transaction_receipt(tx)
+            .await
+            .map_err(eth_err)?
+            .ok_or_else(|| Error::Eth(format!("no receipt for {tx:#x}")))?;
+        Ok((r.gas_used, receipt_fee(&r)))
     }
 }
 

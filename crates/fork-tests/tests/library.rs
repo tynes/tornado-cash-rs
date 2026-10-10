@@ -3,6 +3,7 @@
 
 use alloy::primitives::{Address, U256};
 use tornado_cash_rs::chains::Pool;
+use tornado_cash_rs::error::Error;
 use tornado_cash_rs::eth::{build_tree, deposit_calldata, withdraw_calldata, TornadoClient};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::WithdrawProof;
@@ -88,13 +89,25 @@ async fn deposits_eth() {
     let held = fork.balance(pool.address).await;
 
     let note = Note::random(1, "eth", "0.1");
+    let est = client.estimate_deposit(&pool, &note).await.unwrap();
+    assert!(est.approval_gas.is_empty());
+    // Estimating sends nothing.
+    assert_eq!(
+        fork.api.transaction_count(from, None).await.unwrap(),
+        U256::ZERO
+    );
     let r = client.deposit(&pool, &note).await.unwrap();
 
     assert_eq!(r.leaf_index, next);
     assert_eq!(client.deposit_count(&pool).await.unwrap(), next + 1);
     assert_eq!(fork.balance(pool.address).await, held + pool.denomination());
-    let spent = ether(1) - fork.balance(from).await;
-    assert!(spent > pool.denomination(), "sender also pays gas");
+    // The reported fee is exactly what the sender paid beyond the deposit.
+    assert!(r.fee > U256::ZERO);
+    assert_eq!(
+        ether(1) - fork.balance(from).await,
+        pool.denomination() + r.fee
+    );
+    assert_close(est.gas(), r.gas_used);
     assert!(!client
         .is_spent(&pool, note.nullifier_hash_bytes())
         .await
@@ -118,11 +131,16 @@ async fn deposits_dai() {
     let next = client.deposit_count(&pool).await.unwrap();
     let held = client.balance_of(&pool, pool.address).await.unwrap();
 
-    // Approves the pool first, then deposits.
+    // Approves the pool first, then deposits; the estimate covers both.
     let note = Note::random(1, "dai", "100");
+    let est = client.estimate_deposit(&pool, &note).await.unwrap();
+    assert_eq!(est.approval_gas.len(), 1);
+    assert!(est.fee() <= est.max_fee());
     let r = client.deposit(&pool, &note).await.unwrap();
 
     assert_eq!(r.leaf_index, next);
+    assert_eq!(ether(1) - fork.balance(from).await, r.fee);
+    assert_close(est.gas(), r.gas_used);
     assert_eq!(client.balance_of(&pool, from).await.unwrap(), U256::ZERO);
     assert_eq!(
         client.balance_of(&pool, pool.address).await.unwrap(),
@@ -148,6 +166,64 @@ async fn deposit_without_funds_fails_before_sending() {
     assert_eq!(
         fork.api.transaction_count(from, None).await.unwrap(),
         U256::ZERO
+    );
+}
+
+/// `estimate` is within 25% of the gas `used`.
+fn assert_close(estimate: u64, used: u64) {
+    let (e, u) = (estimate as f64, used as f64);
+    assert!(
+        (e - u).abs() / u < 0.25,
+        "estimated {estimate}, used {used}"
+    );
+}
+
+/// Run `f` on the fork from inside a synchronous `deposit_with` callback.
+fn on_fork<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deposit_reports_whether_it_was_sent() {
+    let Some(fork) = Fork::spawn().await else {
+        return;
+    };
+    let signer = fork.funded_signer(ether(1)).await;
+    let from = signer.address();
+    let client = fork.client(Some(signer)).await;
+    let pool = pool(&client, "eth", "0.1");
+
+    // Rejected on broadcast: the account is emptied after signing.
+    let mut signed = None;
+    let err = client
+        .deposit_with(&pool, &Note::random(1, "eth", "0.1"), |tx| {
+            signed = Some(tx);
+            on_fork(fork.set_balance(from, U256::ZERO));
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotDeposited(_)), "{err}");
+    assert!(signed.is_some());
+    assert_eq!(
+        fork.api.transaction_count(from, None).await.unwrap(),
+        U256::ZERO
+    );
+
+    // Mined but reverted: someone else deposits the same commitment first.
+    fork.set_balance(from, ether(1)).await;
+    let note = Note::random(1, "eth", "0.1");
+    let front = fork.client(Some(fork.funded_signer(ether(1)).await)).await;
+    let err = client
+        .deposit_with(&pool, &note, |_| {
+            on_fork(front.deposit(&pool, &note)).unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::NotDeposited(m) if m.contains("reverted")),
+        "{err}"
     );
 }
 
@@ -192,10 +268,18 @@ async fn self_relayed_withdraw() {
         U256::ZERO,
     )
     .await;
-    let sender = fork.client(Some(fork.funded_signer(ether(1)).await)).await;
-    sender.withdraw(&pool, &proof).await.unwrap();
+    let signer = fork.funded_signer(ether(1)).await;
+    let from = signer.address();
+    let sender = fork.client(Some(signer)).await;
+    let est = sender.estimate_withdraw(&pool, &proof).await.unwrap();
+    assert!(est.fee() <= est.max_fee());
+    let tx = sender.withdraw(&pool, &proof).await.unwrap();
 
     assert_eq!(fork.balance(recipient).await, pool.denomination());
+    // The reported cost is exactly what the sender paid.
+    let (gas_used, fee) = sender.tx_cost(tx).await.unwrap();
+    assert_eq!(ether(1) - fork.balance(from).await, fee);
+    assert_close(est.gas, gas_used);
     assert!(reader
         .is_spent(&pool, note.nullifier_hash_bytes())
         .await

@@ -28,6 +28,10 @@ pub enum Error {
     Relayer(String),
     #[error("ethereum: {0}")]
     Eth(String),
+    /// The deposit definitely did not happen (rejected or reverted), so a
+    /// note saved for it can be discarded.
+    #[error("deposit not made: {0}")]
+    NotDeposited(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

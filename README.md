@@ -88,7 +88,12 @@ relayers; the CLI warns when you use them.
   the Groth16 prover is native arkworks. Every proof is verified against the verifying key from the deployed
   `Verifier.sol` before it is sent anywhere.
 * **The note database** is a single file sealed with XChaCha20-Poly1305 under an Argon2id key; the header is
-  authenticated, writes are atomic and `0600`. A deposit's note is saved *before* the transaction is sent.
+  authenticated, writes are atomic and `0600`. A deposit's note is saved once its transaction is signed and
+  *before* it is broadcast, and removed again only if the deposit is rejected or reverts.
+* **Deposits** print the estimated gas and fee (approvals included for ERC-20 pools) and ask before sending;
+  `--yes`/`-y` skips the prompt and is required when stdin is not a terminal. The gas used and fee paid are
+  printed afterwards. Withdrawals do the same: self-relayed ones show the estimated gas and fee (after the proof
+  is generated, since the estimate needs it), relayed ones show the relayer's fee.
 * **Event sync** pulls `Deposit` events with chunked `eth_getLogs` (span halves on RPC errors) into a
   plaintext cache of public commitments under the data directory.
 

@@ -4,6 +4,7 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
+use std::io::IsTerminal;
 use std::path::Path;
 use tornado_cash_rs::db::{NoteDb, NoteRecord, NoteStatus};
 use tornado_cash_rs::eth::{deposit_calldata, DepositCache};
@@ -238,4 +239,36 @@ async fn import_and_withdraw_through_relayer() {
     assert!(got > U256::ZERO && got < pool.denomination(), "{got}");
     // The fee covers the relayer's gas with room to spare.
     assert!(fork.balance(relayer.reward_account).await > ether(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_deposit_leaves_no_note() {
+    let Some(fork) = Fork::spawn().await else {
+        return;
+    };
+    let dir = data_dir(&fork).await;
+    let d = dir.path();
+    tornado(&fork, d, &["init"]).await.unwrap();
+
+    // Not enough ETH: refused before anything is saved or sent.
+    fork.set_balance(signer().address(), ether(1) / U256::from(20))
+        .await;
+    let err = tornado(&fork, d, &["deposit", "eth", "0.1", "-y"])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("insufficient"), "{err}");
+    assert!(notes(d).is_empty());
+
+    // Without a terminal to confirm on, --yes is required.
+    if !std::io::stdin().is_terminal() {
+        let from = signer().address();
+        fork.set_balance(from, ether(1)).await;
+        let nonce = fork.api.transaction_count(from, None).await.unwrap();
+        let err = tornado(&fork, d, &["deposit", "eth", "0.1"])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--yes"), "{err}");
+        assert!(notes(d).is_empty());
+        assert_eq!(fork.api.transaction_count(from, None).await.unwrap(), nonce);
+    }
 }
