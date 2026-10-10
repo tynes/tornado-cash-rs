@@ -10,7 +10,7 @@ use crate::prover::WithdrawProof;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::client::RpcClient;
+use alloy::rpc::client::ClientBuilder;
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
@@ -340,8 +340,10 @@ impl TornadoClient {
         http: Option<reqwest::Client>,
     ) -> Result<Self> {
         let url: reqwest::Url = rpc_url.parse().map_err(eth_err)?;
-        let transport = Http::with_client(http.unwrap_or_default(), url);
-        let client = RpcClient::new(transport, false);
+        let transport = Http::with_client(http.unwrap_or_default(), url.clone());
+        let client = ClientBuilder::default()
+            .layer(crate::net::RpcLogLayer::new(&url))
+            .transport(transport, false);
         let sender = signer.as_ref().map(|s| s.address());
         let provider: DynProvider = match signer {
             Some(s) => ProviderBuilder::new()
