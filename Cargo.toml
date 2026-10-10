@@ -25,8 +25,6 @@ opt-level = 3
 # dependencies don't carry them). Only that test crate pulls these packages in.
 [patch.crates-io]
 solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
-solar-cli = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
-solar-lsp = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
 solar-lint = { git = "https://github.com/paradigmxyz/solar", rev = "83214bb3a96e42e75cc9d08fcd69e061b396b68f" }
 foundry-wallets = { git = "https://github.com/foundry-rs/foundry-core", rev = "39c03a49ade2f74a6e97e2af308283a42d78d302" }
 foundry-compilers = { git = "https://github.com/foundry-rs/foundry-core", rev = "39c03a49ade2f74a6e97e2af308283a42d78d302" }
