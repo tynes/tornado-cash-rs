@@ -95,7 +95,8 @@ impl Fork {
     }
 
     /// Send a raw call from a freshly funded account, the way a Safe would
-    /// execute calldata it was handed. Returns whether the call succeeded.
+    /// execute calldata it was handed. Returns whether the call succeeded; a
+    /// call that reverts during gas estimation counts as failed.
     pub async fn send_call(&self, to: Address, value: U256, data: Bytes) -> bool {
         let client = self
             .client(Some(self.funded_signer(ether(1000)).await))
@@ -104,8 +105,10 @@ impl Fork {
             .with_to(to)
             .with_value(value)
             .with_input(data);
-        let pending = client.provider().send_transaction(tx).await.unwrap();
-        pending.get_receipt().await.unwrap().status()
+        match client.provider().send_transaction(tx).await {
+            Ok(pending) => pending.get_receipt().await.unwrap().status(),
+            Err(_) => false,
+        }
     }
 
     pub async fn balance(&self, who: Address) -> U256 {
