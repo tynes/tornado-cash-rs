@@ -34,6 +34,9 @@ Environment variables: `ETH_RPC_URL`, `PRIVATE_KEY` or `PRIVATE_KEY_FILE`, `TORN
 `TORNADO_RS_DATA_DIR`, `TORNADO_RS_PROXY` (e.g. `socks5h://127.0.0.1:9050` to route RPC, relayer and artifact
 traffic through Tor).
 
+Notes, the event cache and proving artifacts live in `~/.tornado-cash-rs` unless `--data-dir` or
+`TORNADO_RS_DATA_DIR` says otherwise.
+
 To sign with a Ledger instead of a private key, open the Ethereum app on the device and pass `--ledger` (or set
 `TORNADO_RS_LEDGER=true`). It uses Ledger Live account 0 by default; pick another with `--ledger-index <n>`, or give a
 full path with `--hd-path "m/44'/60'/0'/0"`. On Linux you may need Ledger's udev rules to reach the device.

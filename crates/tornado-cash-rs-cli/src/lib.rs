@@ -27,7 +27,8 @@ use zeroize::Zeroizing;
     about = "Deposit to and withdraw from Tornado Cash Classic pools"
 )]
 pub struct Cli {
-    /// Directory for the note database, event cache and proving artifacts.
+    /// Directory for the note database, event cache and proving artifacts
+    /// [default: ~/.tornado-cash-rs].
     #[arg(long, global = true, env = "TORNADO_RS_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
@@ -292,9 +293,9 @@ fn confirm(yes: bool, msg: &str) -> Result<()> {
 pub async fn run(cli: Cli) -> Result<()> {
     let data_dir = match cli.data_dir {
         Some(d) => d,
-        None => dirs::data_dir()
-            .context("no data directory; pass --data-dir")?
-            .join("tornado-cash-rs"),
+        None => dirs::home_dir()
+            .context("no home directory; pass --data-dir")?
+            .join(".tornado-cash-rs"),
     };
     let mut http = reqwest::Client::builder();
     if let Some(p) = &cli.proxy {
