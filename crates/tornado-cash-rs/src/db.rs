@@ -383,6 +383,14 @@ impl NoteDb {
         self.save()
     }
 
+    /// Delete a note and save. Only for notes whose deposit never happened:
+    /// a deposited note's secret is the only way to withdraw it.
+    pub fn remove(&mut self, id: &str) -> Result<()> {
+        let full = self.get(id)?.id.clone();
+        self.contents.notes.retain(|r| r.id != full);
+        self.save()
+    }
+
     /// Spendable (and pending) totals per chain and currency, from local state only.
     pub fn balances(&self) -> Vec<Balance> {
         let mut map: BTreeMap<(u64, String), Balance> = BTreeMap::new();

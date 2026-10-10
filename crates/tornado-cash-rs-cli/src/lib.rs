@@ -8,10 +8,11 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{bail, Context, Result};
 pub use clap::Parser;
 use clap::Subcommand;
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use tornado_cash_rs::chains::{all_chains, chain_by_id, format_units, parse_units, Tier};
 use tornado_cash_rs::db::{NoteDb, NoteStatus};
+use tornado_cash_rs::error::Error;
 use tornado_cash_rs::eth::{build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::Prover;
@@ -75,11 +76,11 @@ pub struct Cli {
 enum Cmd {
     /// Create an encrypted note database.
     Init,
-    /// Deposit one note into a pool, e.g. `deposit eth 0.1`.
+    /// Deposit one note into a pool, e.g. `deposit eth 0.1`. Shows the estimated gas and fee and asks before sending.
     Deposit {
         currency: String,
         amount: String,
-        /// Skip the confirmation prompt.
+        /// Send without asking for confirmation (required when stdin is not a terminal).
         #[arg(long, short)]
         yes: bool,
     },
@@ -237,17 +238,47 @@ impl App {
 }
 
 fn confirm(yes: bool, msg: &str) -> Result<()> {
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    confirm_from(yes, msg, interactive, &mut stdin.lock())
+}
+
+/// Ask `msg` on stderr and read the answer from `input`. Without a terminal
+/// nobody can answer, so refuse rather than hang or read a stray "y".
+fn confirm_from(yes: bool, msg: &str, interactive: bool, input: &mut impl BufRead) -> Result<()> {
     if yes {
         return Ok(());
+    }
+    if !interactive {
+        bail!("stdin is not a terminal, so there is nobody to confirm; pass --yes to go ahead without the prompt");
     }
     eprint!("{msg} [y/N] ");
     std::io::stderr().flush()?;
     let mut s = String::new();
-    std::io::stdin().read_line(&mut s)?;
+    input.read_line(&mut s)?;
     if !matches!(s.trim(), "y" | "Y" | "yes") {
         bail!("aborted");
     }
     Ok(())
+}
+
+/// Base units as a decimal with about four significant digits, for display.
+fn approx_units(v: U256, decimals: u8) -> String {
+    let x: f64 = format_units(v, decimals).parse().unwrap_or(0.0);
+    if x == 0.0 {
+        return "0".into();
+    }
+    let places = (3 - x.log10().floor() as i32).max(0) as usize;
+    let s = format!("{x:.places$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
+fn gwei(wei: u128) -> String {
+    approx_units(U256::from(wei), 9)
 }
 
 /// Run one `tornado-rs` command.
@@ -346,25 +377,62 @@ async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<(
     let client = app.client(Some(app.signer()?)).await?;
     let pool = client.chain.pool(currency, amount)?.clone();
     let from = client.sender()?;
-    confirm(
-        yes,
-        &format!(
-            "Deposit {} {} on {} from {from}?",
-            pool.amount,
-            pool.currency.to_uppercase(),
-            client.chain.name
-        ),
-    )?;
+    let coin = client.chain.native_symbol;
 
     let note = Note::random(client.chain.chain_id, pool.currency, pool.amount);
-    // Persist the secret before any funds move.
-    let id = db.insert(note.clone(), pool.address, NoteStatus::Pending)?;
-    println!("Saved note {id} to the database");
+    let est = client.estimate_deposit(&pool, &note).await?;
+    println!(
+        "Deposit {} {} on {} from {from}",
+        pool.amount,
+        pool.currency.to_uppercase(),
+        client.chain.name
+    );
+    if !est.approval_gas.is_empty() {
+        println!(
+            "  {} approval(s) first, gas {}",
+            est.approval_gas.len(),
+            est.approval_gas
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
+    }
+    println!("  Gas:   {} (estimated)", est.gas());
+    println!(
+        "  Fee:   ~{} {coin} at {} gwei (at most {} {coin})",
+        approx_units(est.fee(), 18),
+        gwei(est.fees.gas_price),
+        approx_units(est.max_fee(), 18)
+    );
+    confirm(yes, "Send the deposit?")?;
 
-    let r = client.deposit(&pool, &note).await?;
+    // Persist the secret before the deposit is broadcast, so a crash after
+    // that point can't lose funds; drop it only if the deposit surely failed.
+    let mut saved = None;
+    let result = client
+        .deposit_with(&pool, &note, |tx| {
+            let id = db.insert(note.clone(), pool.address, NoteStatus::Pending)?;
+            db.update(&id, |rec| rec.deposit_tx = Some(tx))?;
+            saved = Some(id);
+            Ok(())
+        })
+        .await;
+    let (r, id) = match (result, saved) {
+        (Ok(r), Some(id)) => (r, id),
+        (Ok(_), None) => unreachable!("the note is saved before the deposit is sent"),
+        (Err(e), None) => return Err(e.into()),
+        (Err(e @ Error::NotDeposited(_)), Some(id)) => {
+            db.remove(&id)?;
+            return Err(e.into());
+        }
+        (Err(e), Some(id)) => bail!(
+            "{e}\nNote {id} is kept as pending in case the deposit was mined; \
+             run `tornado-rs balances --check` to update it"
+        ),
+    };
     db.update(&id, |rec| {
         rec.status = NoteStatus::Deposited;
-        rec.deposit_tx = Some(r.tx_hash);
         rec.deposit_block = Some(r.block_number);
         rec.leaf_index = Some(r.leaf_index);
     })?;
@@ -372,6 +440,11 @@ async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<(
         "Deposited note {id} (leaf {}) in {}",
         r.leaf_index,
         client.tx_url(&r.tx_hash)
+    );
+    println!(
+        "Gas used: {}, fee paid: {} {coin}",
+        r.gas_used,
+        approx_units(r.fee, 18)
     );
     println!("Back up the note with `tornado-rs notes export {id}` and keep it secret.");
     Ok(())
@@ -703,4 +776,37 @@ async fn stats(app: &App) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_needs_yes_without_a_terminal() {
+        let err = confirm_from(false, "go?", false, &mut &b"y\n"[..]).unwrap_err();
+        assert!(err.to_string().contains("--yes"), "{err}");
+        confirm_from(true, "go?", false, &mut &b""[..]).unwrap();
+    }
+
+    #[test]
+    fn confirm_reads_the_answer() {
+        confirm_from(false, "go?", true, &mut &b"y\n"[..]).unwrap();
+        confirm_from(false, "go?", true, &mut &b"yes\n"[..]).unwrap();
+        for answer in [&b"\n"[..], b"n\n", b""] {
+            let mut input = answer;
+            let err = confirm_from(false, "go?", true, &mut input).unwrap_err();
+            assert_eq!(err.to_string(), "aborted");
+        }
+    }
+
+    #[test]
+    fn approx_units_keeps_four_significant_digits() {
+        let wei = |s: &str| parse_units(s, 18).unwrap();
+        assert_eq!(approx_units(wei("0.00123456789"), 18), "0.001235");
+        assert_eq!(approx_units(wei("1.5"), 18), "1.5");
+        assert_eq!(approx_units(wei("0.000000123"), 18), "0.000000123");
+        assert_eq!(approx_units(U256::ZERO, 18), "0");
+        assert_eq!(gwei(12_345_678_901), "12.35");
+    }
 }
