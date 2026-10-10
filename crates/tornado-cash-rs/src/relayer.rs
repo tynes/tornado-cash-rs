@@ -3,6 +3,7 @@
 
 use crate::chains::Pool;
 use crate::error::{Error, Result};
+use crate::net::fetch;
 use crate::prover::WithdrawProof;
 use alloy::primitives::{Address, B256, U256};
 use serde::Deserialize;
@@ -87,13 +88,9 @@ impl RelayerClient {
     }
 
     pub async fn status(&self) -> Result<RelayerStatus> {
-        let r = self
-            .http
-            .get(format!("{}/status", self.base))
-            .send()
-            .await?;
-        let r = r.error_for_status()?;
-        Ok(r.json().await?)
+        let req = self.http.get(format!("{}/status", self.base));
+        let r = fetch(&self.http, req, "relayer status", false, true).await?;
+        Ok(serde_json::from_slice(&r.body)?)
     }
 
     /// The fee to put in the proof: gas for the relayed transaction plus the
@@ -146,14 +143,13 @@ impl RelayerClient {
                 u(&a.refund),
             ],
         });
-        let r = self
+        let req = self
             .http
             .post(format!("{}/v1/tornadoWithdraw", self.base))
-            .json(&body)
-            .send()
-            .await?;
-        let status = r.status();
-        let v: Value = r.json().await.unwrap_or(Value::Null);
+            .json(&body);
+        let r = fetch(&self.http, req, "relayer withdraw", false, false).await?;
+        let status = r.status;
+        let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
         if !status.is_success() {
             let msg = v
                 .get("error")
@@ -168,12 +164,9 @@ impl RelayerClient {
     }
 
     pub async fn job(&self, id: &str) -> Result<JobStatus> {
-        let r = self
-            .http
-            .get(format!("{}/v1/jobs/{id}", self.base))
-            .send()
-            .await?;
-        Ok(r.error_for_status()?.json().await?)
+        let req = self.http.get(format!("{}/v1/jobs/{id}", self.base));
+        let r = fetch(&self.http, req, "relayer job status", false, true).await?;
+        Ok(serde_json::from_slice(&r.body)?)
     }
 
     /// Poll a job until it is CONFIRMED (returns its tx hash) or FAILED.

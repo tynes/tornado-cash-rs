@@ -40,6 +40,19 @@ pub struct Cli {
     #[arg(long, global = true, env = "TORNADO_RS_PROXY")]
     proxy: Option<String>,
 
+    /// Log every network request to stderr: what it is, where it goes, status, size and time.
+    /// `full` also logs request and response bodies (addresses, proofs, signed transactions).
+    #[arg(
+        long,
+        global = true,
+        env = "TORNADO_RS_LOG_NETWORK",
+        value_name = "DETAIL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "summary"
+    )]
+    log_network: Option<NetLog>,
+
     /// Maximum block range per eth_getLogs request.
     #[arg(long, global = true, default_value_t = 10_000)]
     log_span: u64,
@@ -89,6 +102,25 @@ pub struct Cli {
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum NetLog {
+    /// One line per request.
+    Summary,
+    /// Request and response bodies as well.
+    Full,
+}
+
+impl Cli {
+    /// The tracing directive `--log-network` asks for, if any.
+    pub fn network_log_directive(&self) -> Option<String> {
+        let level = match self.log_network? {
+            NetLog::Summary => "info",
+            NetLog::Full => "trace",
+        };
+        Some(format!("{}={level}", tornado_cash_rs::net::TARGET))
+    }
 }
 
 #[derive(Subcommand)]
@@ -289,6 +321,53 @@ fn confirm(yes: bool, msg: &str) -> Result<()> {
     Ok(())
 }
 
+/// Say where requests will physically go, since the per-request log lines
+/// show only their final destination.
+fn log_route(proxy: Option<&str>) {
+    use tornado_cash_rs::net::{redact_url, TARGET};
+    match proxy {
+        Some(p) => {
+            let shown = p.parse().map(|u| redact_url(&u)).unwrap_or_default();
+            let dns = if p.starts_with("socks5://") || p.starts_with("socks4://") {
+                "hostnames are resolved locally by the system resolver (use socks5h:// to resolve through the proxy)"
+            } else {
+                "the proxy resolves hostnames"
+            };
+            tracing::info!(target: TARGET, "all requests go through proxy {shown}; {dns}");
+        }
+        None => {
+            // Without --proxy, reqwest picks up the standard proxy variables.
+            let env: Vec<String> = [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .iter()
+            .filter_map(|k| {
+                let v = std::env::var(k).ok().filter(|v| !v.is_empty())?;
+                let shown = v.parse().map(|u| redact_url(&u)).unwrap_or_default();
+                Some(format!("{k}={shown}"))
+            })
+            .collect();
+            if env.is_empty() {
+                tracing::info!(
+                    target: TARGET,
+                    "no proxy: requests connect directly and hostnames are resolved by the system resolver"
+                );
+            } else {
+                tracing::info!(
+                    target: TARGET,
+                    "no --proxy, but requests use the proxy from {} (hosts in NO_PROXY connect directly)",
+                    env.join(", ")
+                );
+            }
+        }
+    }
+}
+
 /// Run one `tornado-rs` command.
 pub async fn run(cli: Cli) -> Result<()> {
     let data_dir = match cli.data_dir {
@@ -301,6 +380,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(p) = &cli.proxy {
         http = http.proxy(reqwest::Proxy::all(p).context("invalid --proxy")?);
     }
+    log_route(cli.proxy.as_deref());
     let app = App {
         data_dir,
         rpc_url: cli.rpc_url,

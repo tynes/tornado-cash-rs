@@ -57,13 +57,10 @@ impl Artifact {
             }
             tracing::warn!("{} failed its checksum, downloading again", path.display());
         }
-        let bytes = client
-            .get(self.url)
-            .send()
+        let what = format!("download {}", self.file_name);
+        let bytes = crate::net::fetch(client, client.get(self.url), &what, true, true)
             .await?
-            .error_for_status()?
-            .bytes()
-            .await?
+            .body
             .to_vec();
         if sha256_hex(&bytes) != self.sha256 {
             return Err(self.err("downloaded file does not match the pinned SHA-256"));

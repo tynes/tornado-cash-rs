@@ -41,6 +41,24 @@ To sign with a Ledger instead of a private key, open the Ethereum app on the dev
 `TORNADO_RS_LEDGER=true`). It uses Ledger Live account 0 by default; pick another with `--ledger-index <n>`, or give a
 full path with `--hd-path "m/44'/60'/0'/0"`. On Linux you may need Ledger's udev rules to reach the device.
 
+### Seeing network activity
+
+`--log-network` (or `TORNADO_RS_LOG_NETWORK=summary`) prints one line to stderr for every request the CLI
+sends: what it is, where it goes, the result, the response size and the time taken. It also says whether
+traffic goes through a proxy and who resolves hostnames.
+
+```
+INFO tornado_cash_rs::net: no proxy: requests connect directly and hostnames are resolved by the system resolver
+INFO tornado_cash_rs::net: POST https://mainnet.infura.io/… [rpc eth_chainId] -> ok, 5 B in 464 ms
+INFO tornado_cash_rs::net: GET https://raw.githubusercontent.com/…/tornado.json [download tornado.json] -> 200 OK, 18.6 MiB in 1509 ms
+```
+
+RPC URLs are shown as origin only (`/…`), since they often carry an API key. `--log-network=full` also prints
+request and response bodies: RPC parameters and results, signed transactions, relayer requests with the
+proof and recipient. Treat that output as sensitive. The CLI talks only to the RPC endpoint, the relayer you
+pass, and `raw.githubusercontent.com` for the proving artifacts. For connection-level detail (DNS, TLS,
+connection reuse), add `TORNADO_RS_LOG=hyper_util=debug,reqwest=debug`.
+
 ## Supported chains
 
 | tier | chains | pools |
