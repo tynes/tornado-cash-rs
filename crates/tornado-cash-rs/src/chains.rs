@@ -62,7 +62,7 @@ impl Chain {
     }
 }
 
-fn same_amount(a: &str, b: &str) -> bool {
+pub(crate) fn same_amount(a: &str, b: &str) -> bool {
     let norm = |s: &str| {
         let s = s.trim();
         if s.contains('.') {

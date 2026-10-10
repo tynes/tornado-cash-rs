@@ -12,8 +12,10 @@ pub use clap::Parser;
 use clap::Subcommand;
 use std::io::Write;
 use std::path::PathBuf;
-use tornado_cash_rs::chains::{all_chains, chain_by_id, format_units, parse_units, Tier};
-use tornado_cash_rs::db::{NoteDb, NoteStatus};
+use tornado_cash_rs::chains::{
+    all_chains, chain_by_id, chain_by_name, format_units, parse_units, Tier,
+};
+use tornado_cash_rs::db::{NoteDb, NoteFilter, NoteStatus};
 use tornado_cash_rs::eth::{
     self, build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient,
 };
@@ -188,8 +190,26 @@ enum Cmd {
 enum NotesCmd {
     /// List notes (without secrets).
     List,
-    /// Print a note's secret string, for backup or use in another wallet.
-    Export { id: String },
+    /// Print note secret strings, one per line, for backup or use in another wallet.
+    ///
+    /// Pass a note ID, --all, or any of --network/--currency/--amount (combined with AND).
+    Export {
+        /// Note ID from `notes list` (a unique prefix is enough).
+        #[arg(conflicts_with_all = ["all", "network", "currency", "amount"])]
+        id: Option<String>,
+        /// Export every note in the database.
+        #[arg(long, conflicts_with_all = ["network", "currency", "amount"])]
+        all: bool,
+        /// Only notes on this network (name from `pools`, or chain ID).
+        #[arg(long)]
+        network: Option<String>,
+        /// Only notes in this currency, e.g. eth.
+        #[arg(long)]
+        currency: Option<String>,
+        /// Only notes of this amount, e.g. 0.1.
+        #[arg(long)]
+        amount: Option<String>,
+    },
     /// Import a tornado-cli note string. Checks the chain for its deposit when --rpc-url is set.
     Import {
         /// Read from the TORNADO_NOTE env var or a prompt if omitted, to keep it out of shell history.
@@ -824,11 +844,43 @@ async fn notes(app: &App, cmd: NotesCmd) -> Result<()> {
             }
             Ok(())
         }
-        NotesCmd::Export { id } => {
+        NotesCmd::Export {
+            id,
+            all,
+            network,
+            currency,
+            amount,
+        } => {
+            let filter = NoteFilter {
+                chain_id: network
+                    .map(|n| chain_by_name(&n).map(|c| c.chain_id))
+                    .transpose()?,
+                currency,
+                amount,
+            };
+            if id.is_none() && !all && filter.is_empty() {
+                bail!("pass a note ID, --all, or a filter (--network, --currency, --amount)");
+            }
             let db = app.open_db()?;
-            let r = db.get(&id)?;
-            eprintln!("Anyone with this string can withdraw the note:");
-            println!("{}", r.note.to_note_string());
+            let records = match &id {
+                Some(id) => vec![db.get(id)?],
+                None => db.select(&filter),
+            };
+            if records.is_empty() {
+                bail!("no notes match");
+            }
+            if records.len() == 1 {
+                eprintln!("Anyone with this string can withdraw the note:");
+            } else {
+                eprintln!("Anyone with these strings can withdraw the notes:");
+            }
+            for r in &records {
+                println!("{}", r.note.to_note_string());
+            }
+            if id.is_none() {
+                let n = records.len();
+                eprintln!("Exported {n} note{}", if n == 1 { "" } else { "s" });
+            }
             Ok(())
         }
         NotesCmd::Import { note, label } => {
