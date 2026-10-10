@@ -6,7 +6,10 @@
 
 pub mod relayer;
 
-use alloy::primitives::{keccak256, Address, B256, U256};
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use anvil::eth::EthApi;
@@ -89,6 +92,23 @@ impl Fork {
             .anvil_set_storage_at(DAI, slot.into(), B256::from(amount))
             .await
             .unwrap();
+    }
+
+    /// Send a raw call from a freshly funded account, the way a Safe would
+    /// execute calldata it was handed. Returns whether the call succeeded; a
+    /// call that reverts during gas estimation counts as failed.
+    pub async fn send_call(&self, to: Address, value: U256, data: Bytes) -> bool {
+        let client = self
+            .client(Some(self.funded_signer(ether(1000)).await))
+            .await;
+        let tx = TransactionRequest::default()
+            .with_to(to)
+            .with_value(value)
+            .with_input(data);
+        match client.provider().send_transaction(tx).await {
+            Ok(pending) => pending.get_receipt().await.unwrap().status(),
+            Err(_) => false,
+        }
     }
 
     pub async fn balance(&self, who: Address) -> U256 {
