@@ -3,7 +3,9 @@
 //! The binary is a thin wrapper around [`run`], which lets tests drive the CLI
 //! in-process.
 
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
+use alloy::signers::ledger::{HDPath, LedgerSigner};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{bail, Context, Result};
 pub use clap::Parser;
@@ -69,6 +71,23 @@ pub struct Cli {
     #[arg(long, global = true, env = "PRIVATE_KEY_FILE")]
     private_key_file: Option<PathBuf>,
 
+    /// Sign with a Ledger hardware wallet instead of a private key.
+    #[arg(long, global = true, env = "TORNADO_RS_LEDGER")]
+    ledger: bool,
+
+    /// Ledger Live account index to sign with (path m/44'/60'/<index>'/0/0).
+    #[arg(long, global = true, default_value_t = 0, requires = "ledger")]
+    ledger_index: usize,
+
+    /// Full derivation path for the Ledger account, e.g. m/44'/60'/0'/0 for legacy MEW/MyCrypto accounts.
+    #[arg(
+        long,
+        global = true,
+        requires = "ledger",
+        conflicts_with = "ledger_index"
+    )]
+    hd_path: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -93,7 +112,7 @@ enum Cmd {
         /// Relayer URL. Without it you must pass --self-relay.
         #[arg(long)]
         relayer: Option<String>,
-        /// Send the withdrawal from PRIVATE_KEY's account (links that account to the withdrawal).
+        /// Send the withdrawal from your own account (PRIVATE_KEY or --ledger) (links that account to the withdrawal).
         #[arg(long, conflicts_with = "relayer")]
         self_relay: bool,
         /// ERC-20 pools only: native coin the relayer should send the recipient, e.g. 0.01.
@@ -166,6 +185,7 @@ struct App {
     password: Option<Zeroizing<String>>,
     private_key: Option<Zeroizing<String>>,
     private_key_file: Option<PathBuf>,
+    ledger: Option<HDPath>,
 }
 
 impl App {
@@ -191,12 +211,12 @@ impl App {
         NoteDb::open(&path, &pw).context("opening note database")
     }
 
-    async fn client(&self, signer: Option<PrivateKeySigner>) -> Result<TornadoClient> {
+    async fn client(&self, signer: Option<EthereumWallet>) -> Result<TornadoClient> {
         let url = self
             .rpc_url
             .as_deref()
             .context("set --rpc-url or ETH_RPC_URL")?;
-        let c = TornadoClient::connect(url, signer, Some(self.http.clone())).await?;
+        let c = TornadoClient::connect_with_wallet(url, signer, Some(self.http.clone())).await?;
         if c.chain.tier == Tier::Secondary {
             eprintln!(
                 "warning: {} has small anonymity sets and few relayers; mainnet gives far better privacy",
@@ -242,7 +262,24 @@ impl App {
         }
     }
 
-    fn signer(&self) -> Result<PrivateKeySigner> {
+    /// The wallet for deposits and self-relayed withdrawals: the Ledger when
+    /// --ledger is set, otherwise the private key.
+    async fn signer(&self) -> Result<EthereumWallet> {
+        if let Some(path) = &self.ledger {
+            // The chain id comes from each transaction. The HID transport
+            // panics when USB is unavailable, so contain that in a task.
+            let ledger = tokio::spawn(LedgerSigner::new(path.clone(), None))
+                .await
+                .map_err(|_| anyhow::anyhow!("could not open USB HID to look for a Ledger"))?
+                .context(
+                    "connecting to the Ledger; is it plugged in, unlocked, and on the Ethereum app?",
+                )?;
+            eprintln!(
+                "Using Ledger account {} ({path}); confirm each transaction on the device",
+                alloy::signers::Signer::address(&ledger)
+            );
+            return Ok(EthereumWallet::from(ledger));
+        }
         let raw = if let Some(path) = &self.private_key_file {
             Zeroizing::new(std::fs::read_to_string(path).context("reading PRIVATE_KEY_FILE")?)
         } else if let Some(k) = &self.private_key {
@@ -252,6 +289,7 @@ impl App {
         };
         raw.trim()
             .parse::<PrivateKeySigner>()
+            .map(EthereumWallet::from)
             .context("invalid private key")
     }
 }
@@ -293,6 +331,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         password: cli.password.map(Zeroizing::new),
         private_key: cli.private_key.map(Zeroizing::new),
         private_key_file: cli.private_key_file,
+        ledger: cli.ledger.then_some(match cli.hd_path {
+            Some(p) => HDPath::Other(p),
+            None => HDPath::LedgerLive(cli.ledger_index),
+        }),
     };
 
     match cli.cmd {
@@ -363,7 +405,7 @@ fn init(app: &App) -> Result<()> {
 
 async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<()> {
     let mut db = app.open_db()?;
-    let client = app.client(Some(app.signer()?)).await?;
+    let client = app.client(Some(app.signer().await?)).await?;
     let pool = client.chain.pool(currency, amount)?.clone();
     let from = client.sender()?;
     confirm(
@@ -413,7 +455,7 @@ async fn withdraw(
     // The local status is only a hint; the chain decides whether the note is spent.
     let rec = db.get(id)?.clone();
     let signer = if self_relay {
-        Some(app.signer()?)
+        Some(app.signer().await?)
     } else {
         None
     };
