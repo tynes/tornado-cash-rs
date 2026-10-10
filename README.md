@@ -33,6 +33,9 @@ Environment variables: `ETH_RPC_URL`, `PRIVATE_KEY` or `PRIVATE_KEY_FILE`, `TORN
 `TORNADO_RS_DATA_DIR`, `TORNADO_RS_PROXY` (e.g. `socks5h://127.0.0.1:9050` to route RPC, relayer and artifact
 traffic through Tor).
 
+Notes, the event cache and proving artifacts live in `~/.tornado-cash-rs` unless `--data-dir` or
+`TORNADO_RS_DATA_DIR` says otherwise.
+
 ## Supported chains
 
 | tier | chains | pools |
