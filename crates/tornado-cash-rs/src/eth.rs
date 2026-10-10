@@ -13,7 +13,7 @@ use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::http::Http;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -132,6 +132,39 @@ pub fn receipt_withdraws(
             && ITornadoInstance::Withdrawal::decode_log_data(&data)
                 .is_ok_and(|ev| ev.nullifierHash == nullifier_hash)
     })
+}
+
+/// Calldata for the pool's `deposit` call for `note`, for sending from another
+/// wallet such as a Safe. A native-coin pool needs the pool's denomination as
+/// the call's value; an ERC-20 pool needs an [`approve_calldata`] call first.
+pub fn deposit_calldata(note: &Note) -> Bytes {
+    ITornadoInstance::depositCall {
+        _commitment: note.commitment_bytes(),
+    }
+    .abi_encode()
+    .into()
+}
+
+/// Calldata for the pool's `withdraw` call with proof `w`. The call's value
+/// must equal the proof's refund (zero unless a relayer pays one).
+pub fn withdraw_calldata(w: &WithdrawProof) -> Bytes {
+    let a = &w.args;
+    ITornadoInstance::withdrawCall {
+        _proof: Bytes::copy_from_slice(&w.proof_bytes()),
+        _root: a.root,
+        _nullifierHash: a.nullifier_hash,
+        _recipient: a.recipient,
+        _relayer: a.relayer,
+        _fee: a.fee,
+        _refund: a.refund,
+    }
+    .abi_encode()
+    .into()
+}
+
+/// Calldata for an ERC-20 `approve(spender, amount)` call.
+pub fn approve_calldata(spender: Address, amount: U256) -> Bytes {
+    IERC20::approveCall { spender, amount }.abi_encode().into()
 }
 
 /// The `approve` calls needed to raise `allowance` to `needed`. Tokens like
@@ -718,5 +751,14 @@ mod tests {
             approvals_needed(U256::from(50u64), need),
             vec![U256::ZERO, need]
         );
+    }
+
+    #[test]
+    fn deposit_calldata_encodes_the_commitment() {
+        let note = Note::random(1, "eth", "0.1");
+        let data = deposit_calldata(&note);
+        assert_eq!(data[..4], ITornadoInstance::depositCall::SELECTOR);
+        let call = ITornadoInstance::depositCall::abi_decode(&data).unwrap();
+        assert_eq!(call._commitment, note.commitment_bytes());
     }
 }

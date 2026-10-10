@@ -12,7 +12,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use tornado_cash_rs::chains::{all_chains, chain_by_id, format_units, parse_units, Tier};
 use tornado_cash_rs::db::{NoteDb, NoteStatus};
-use tornado_cash_rs::eth::{build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient};
+use tornado_cash_rs::eth::{
+    self, build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient,
+};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::Prover;
 use tornado_cash_rs::relayer::RelayerClient;
@@ -82,13 +84,17 @@ enum Cmd {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+        /// Save the note as pending and print the deposit calldata instead of sending
+        /// it, e.g. for a Safe. The pool address and value go to stderr.
+        #[arg(long)]
+        calldata: bool,
     },
     /// Withdraw a note to a recipient, through a relayer or from your own account.
     Withdraw {
         /// Note id (or unique prefix) from `notes list`.
         id: String,
         recipient: Address,
-        /// Relayer URL. Without it you must pass --self-relay.
+        /// Relayer URL. Without it you must pass --self-relay or --calldata.
         #[arg(long)]
         relayer: Option<String>,
         /// Send the withdrawal from PRIVATE_KEY's account (links that account to the withdrawal).
@@ -100,6 +106,10 @@ enum Cmd {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+        /// Print the withdrawal calldata for another account (e.g. a Safe) to send
+        /// instead of sending it. The pool address and value go to stderr.
+        #[arg(long, conflicts_with_all = ["relayer", "self_relay", "refund"])]
+        calldata: bool,
     },
     /// Show balances from the local note database.
     Balances {
@@ -280,7 +290,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Deposit {
             currency,
             amount,
+            yes: _,
+            calldata: true,
+        } => deposit_calldata(&app, &currency, &amount).await,
+        Cmd::Deposit {
+            currency,
+            amount,
             yes,
+            calldata: false,
         } => deposit(&app, &currency, &amount, yes).await,
         Cmd::Withdraw {
             id,
@@ -289,7 +306,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             self_relay,
             refund,
             yes,
-        } => withdraw(&app, &id, recipient, relayer, self_relay, refund, yes).await,
+            calldata,
+        } => {
+            withdraw(
+                &app, &id, recipient, relayer, self_relay, refund, yes, calldata,
+            )
+            .await
+        }
         Cmd::Balances { check } => balances(&app, check).await,
         Cmd::Notes(n) => notes(&app, n).await,
         Cmd::Sync { currency, amount } => {
@@ -377,6 +400,43 @@ async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<(
     Ok(())
 }
 
+/// Generate and save a note, then print the calldata for depositing it from
+/// another account. The note stays pending until `balances --check` finds the
+/// deposit on-chain.
+async fn deposit_calldata(app: &App, currency: &str, amount: &str) -> Result<()> {
+    let mut db = app.open_db()?;
+    let client = app.client(None).await?;
+    let pool = client.chain.pool(currency, amount)?.clone();
+    let note = Note::random(client.chain.chain_id, pool.currency, pool.amount);
+    // The other account may send the call much later, so the note must be
+    // saved before the calldata is handed out.
+    let id = db.insert(note.clone(), pool.address, NoteStatus::Pending)?;
+    eprintln!("Saved note {id} to the database as pending");
+    let denomination = pool.denomination();
+    if let Some(token) = pool.token {
+        eprintln!(
+            "First approve the pool to spend {} {}: to {token}, value 0, data {}",
+            pool.amount,
+            pool.currency.to_uppercase(),
+            eth::approve_calldata(pool.address, denomination)
+        );
+        eprintln!("(Tokens like USDT need the allowance set to 0 before a new approval.)");
+        eprintln!("Then send the deposit: to {}, value 0", pool.address);
+    } else {
+        eprintln!(
+            "Send the deposit: to {}, value {denomination} wei ({} {})",
+            pool.address,
+            pool.amount,
+            pool.currency.to_uppercase()
+        );
+    }
+    eprintln!("Once it is mined, run `tornado-rs balances --check` to mark the note deposited.");
+    eprintln!("Back up the note with `tornado-rs notes export {id}` and keep it secret.");
+    println!("{}", eth::deposit_calldata(&note));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn withdraw(
     app: &App,
     id: &str,
@@ -385,9 +445,10 @@ async fn withdraw(
     self_relay: bool,
     refund: Option<String>,
     yes: bool,
+    calldata: bool,
 ) -> Result<()> {
-    if relayer.is_none() && !self_relay {
-        bail!("pass --relayer <url>, or --self-relay to pay gas from your own account (which links it to this withdrawal)");
+    if relayer.is_none() && !self_relay && !calldata {
+        bail!("pass --relayer <url>, --self-relay to pay gas from your own account (which links it to this withdrawal), or --calldata to print the call for another account to send");
     }
     let mut db = app.open_db()?;
     // The local status is only a hint; the chain decides whether the note is spent.
@@ -441,6 +502,30 @@ async fn withdraw(
 
     eprintln!("Loading proving key...");
     let prover = Prover::load(&app.artifacts_dir(), Some(app.http.clone())).await?;
+
+    if calldata {
+        eprintln!("Generating proof...");
+        let proof = prover.prove_withdrawal(
+            &rec.note,
+            &path,
+            recipient,
+            Address::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        )?;
+        eprintln!(
+            "Send the withdrawal of {} {} to {recipient}: to {}, value 0",
+            pool.amount,
+            pool.currency.to_uppercase(),
+            pool.address
+        );
+        eprintln!(
+            "Once it is mined, run `tornado-rs balances --check` to mark note {} spent.",
+            rec.id
+        );
+        println!("{}", eth::withdraw_calldata(&proof));
+        return Ok(());
+    }
 
     let tx = if let Some(url) = relayer {
         let rc = RelayerClient::new(&url, Some(app.http.clone()))?;

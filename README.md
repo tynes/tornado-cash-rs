@@ -25,9 +25,15 @@ tornado-rs balances
 tornado-rs notes list
 tornado-rs withdraw <note-id> 0xRecipient --relayer https://relayer.example
 tornado-rs withdraw <note-id> 0xRecipient --self-relay   # pays gas from PRIVATE_KEY's account
+tornado-rs withdraw <note-id> 0xRecipient --calldata     # prints the call for another account to send
 tornado-rs notes import tornado-eth-0.1-1-0x...          # bring in tornado-cli notes
 tornado-rs stats                                         # deposit counts per pool
 ```
+
+`deposit --calldata` and `withdraw --calldata` send nothing: they print only the `0x` calldata on stdout, so it
+can be nested in another tool's command (for example a Safe CLI), and print the target pool and the value to send
+on stderr. A deposit made this way saves its note as pending first; `balances --check` marks it deposited once the
+call is mined. ETH deposits need the pool's denomination as the call's value, which the other tool supplies.
 
 Environment variables: `ETH_RPC_URL`, `PRIVATE_KEY` or `PRIVATE_KEY_FILE`, `TORNADO_PASSWORD` (for scripts),
 `TORNADO_RS_DATA_DIR`, `TORNADO_RS_PROXY` (e.g. `socks5h://127.0.0.1:9050` to route RPC, relayer and artifact
