@@ -3,7 +3,7 @@
 
 use alloy::primitives::{Address, U256};
 use tornado_cash_rs::chains::Pool;
-use tornado_cash_rs::eth::{build_tree, TornadoClient};
+use tornado_cash_rs::eth::{build_tree, deposit_calldata, withdraw_calldata, TornadoClient};
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::WithdrawProof;
 use tornado_cash_rs::relayer::RelayerClient;
@@ -203,6 +203,47 @@ async fn self_relayed_withdraw() {
     // The same nullifier cannot be spent twice.
     assert!(sender.withdraw(&pool, &proof).await.is_err());
     assert_eq!(fork.balance(recipient).await, pool.denomination());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn calldata_sent_from_another_account() {
+    let Some(fork) = Fork::spawn().await else {
+        return;
+    };
+    let reader = fork.client(None).await;
+    let pool = pool(&reader, "eth", "0.1");
+    let note = Note::random(1, "eth", "0.1");
+    // Without the denomination as value the pool rejects the deposit.
+    assert!(
+        !fork
+            .send_call(pool.address, U256::ZERO, deposit_calldata(&note))
+            .await
+    );
+    assert!(
+        fork.send_call(pool.address, pool.denomination(), deposit_calldata(&note))
+            .await
+    );
+
+    let recipient = Address::random();
+    let proof = prove(
+        &fork,
+        &reader,
+        &pool,
+        &note,
+        recipient,
+        Address::ZERO,
+        U256::ZERO,
+    )
+    .await;
+    assert!(
+        fork.send_call(pool.address, U256::ZERO, withdraw_calldata(&proof))
+            .await
+    );
+    assert_eq!(fork.balance(recipient).await, pool.denomination());
+    assert!(reader
+        .is_spent(&pool, note.nullifier_hash_bytes())
+        .await
+        .unwrap());
 }
 
 /// Deposit, then withdraw through the mock relayer; returns
