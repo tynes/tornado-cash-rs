@@ -251,30 +251,13 @@ fn confirm(yes: bool, msg: &str) -> Result<()> {
     Ok(())
 }
 
-/// The default data dir, `~/.tornado-cash-rs`. Earlier versions used the platform data dir (e.g.
-/// `~/Library/Application Support` on macOS); notes left there are not moved,
-/// so point at them rather than silently hiding them.
-fn default_data_dir() -> Result<PathBuf> {
-    let dir = dirs::home_dir()
-        .context("no home directory; pass --data-dir")?
-        .join(".tornado-cash-rs");
-    if let Some(old) = dirs::data_dir().map(|d| d.join("tornado-cash-rs")) {
-        if old.join("notes.db").exists() && !dir.join("notes.db").exists() {
-            eprintln!(
-                "note: found notes at {}; the default data dir is now {} (pass --data-dir to use the old one)",
-                old.display(),
-                dir.display()
-            );
-        }
-    }
-    Ok(dir)
-}
-
 /// Run one `tornado-rs` command.
 pub async fn run(cli: Cli) -> Result<()> {
     let data_dir = match cli.data_dir {
         Some(d) => d,
-        None => default_data_dir()?,
+        None => dirs::home_dir()
+            .context("no home directory; pass --data-dir")?
+            .join(".tornado-cash-rs"),
     };
     let mut http = reqwest::Client::builder();
     if let Some(p) = &cli.proxy {
