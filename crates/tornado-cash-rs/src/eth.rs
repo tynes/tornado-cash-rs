@@ -7,7 +7,7 @@ use crate::hash::fr_from_be_bytes;
 use crate::merkle::MerkleTree;
 use crate::note::Note;
 use crate::prover::WithdrawProof;
-use alloy::network::EthereumWallet;
+use alloy::network::{Ethereum, EthereumWallet, NetworkWallet};
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::client::RpcClient;
@@ -339,13 +339,26 @@ impl TornadoClient {
         signer: Option<PrivateKeySigner>,
         http: Option<reqwest::Client>,
     ) -> Result<Self> {
+        Self::connect_with_wallet(rpc_url, signer.map(EthereumWallet::from), http).await
+    }
+
+    /// Like [`connect`](Self::connect), but with any wallet, such as one
+    /// backed by a hardware signer. Transactions are sent from the wallet's
+    /// default signer.
+    pub async fn connect_with_wallet(
+        rpc_url: &str,
+        wallet: Option<EthereumWallet>,
+        http: Option<reqwest::Client>,
+    ) -> Result<Self> {
         let url: reqwest::Url = rpc_url.parse().map_err(eth_err)?;
         let transport = Http::with_client(http.unwrap_or_default(), url);
         let client = RpcClient::new(transport, false);
-        let sender = signer.as_ref().map(|s| s.address());
-        let provider: DynProvider = match signer {
-            Some(s) => ProviderBuilder::new()
-                .wallet(EthereumWallet::from(s))
+        let sender = wallet
+            .as_ref()
+            .map(NetworkWallet::<Ethereum>::default_signer_address);
+        let provider: DynProvider = match wallet {
+            Some(w) => ProviderBuilder::new()
+                .wallet(w)
                 .connect_client(client)
                 .erased(),
             None => ProviderBuilder::new().connect_client(client).erased(),
