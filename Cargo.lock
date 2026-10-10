@@ -12153,13 +12153,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "solar-cli"
-version = "0.2.0"
-source = "git+https://github.com/paradigmxyz/solar?rev=83214bb3a96e42e75cc9d08fcd69e061b396b68f#83214bb3a96e42e75cc9d08fcd69e061b396b68f"
-
-[[patch.unused]]
-name = "solar-lsp"
-version = "0.2.0"
-source = "git+https://github.com/paradigmxyz/solar?rev=83214bb3a96e42e75cc9d08fcd69e061b396b68f#83214bb3a96e42e75cc9d08fcd69e061b396b68f"

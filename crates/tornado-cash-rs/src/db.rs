@@ -14,7 +14,7 @@
 //! snapshot, so two handles open at once could otherwise silently drop each
 //! other's notes; the lock makes a second process fail fast instead.
 
-use crate::chains::{chain_by_id, format_units};
+use crate::chains::{chain_by_id, format_units, same_amount};
 use crate::error::{Error, Result};
 use crate::note::Note;
 use alloy::primitives::{Address, B256, U256};
@@ -113,6 +113,32 @@ pub struct NoteRecord {
     pub withdraw_tx: Option<B256>,
     #[serde(default)]
     pub withdraw_recipient: Option<Address>,
+}
+
+/// Selects notes by chain, currency and amount. Unset fields match anything.
+#[derive(Clone, Debug, Default)]
+pub struct NoteFilter {
+    pub chain_id: Option<u64>,
+    pub currency: Option<String>,
+    pub amount: Option<String>,
+}
+
+impl NoteFilter {
+    pub fn is_empty(&self) -> bool {
+        self.chain_id.is_none() && self.currency.is_none() && self.amount.is_none()
+    }
+
+    pub fn matches(&self, r: &NoteRecord) -> bool {
+        self.chain_id.is_none_or(|c| r.note.chain_id == c)
+            && self
+                .currency
+                .as_deref()
+                .is_none_or(|c| r.note.currency.eq_ignore_ascii_case(c.trim()))
+            && self
+                .amount
+                .as_deref()
+                .is_none_or(|a| same_amount(&r.note.amount, a))
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -354,6 +380,15 @@ impl NoteDb {
         &self.contents.notes
     }
 
+    /// Notes matching `filter`, oldest first.
+    pub fn select(&self, filter: &NoteFilter) -> Vec<&NoteRecord> {
+        self.contents
+            .notes
+            .iter()
+            .filter(|r| filter.matches(r))
+            .collect()
+    }
+
     /// Find a note by id or unique id prefix.
     pub fn get(&self, id: &str) -> Result<&NoteRecord> {
         let id = id.trim().to_lowercase();
@@ -466,6 +501,61 @@ mod tests {
         let b = db.balances();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].formatted(), "0.1");
+    }
+
+    #[test]
+    fn select_filters_by_chain_currency_and_amount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.db");
+        let pool = address!("12D66f87A04A9E220743712cE6d9bB1B5616B8Fc");
+        let mut db = NoteDb::create(&path, "pw").unwrap();
+        for (chain, cur, amt) in [
+            (1, "eth", "0.1"),
+            (1, "eth", "1"),
+            (1, "dai", "100"),
+            (11155111, "eth", "0.1"),
+        ] {
+            db.insert(Note::random(chain, cur, amt), pool, NoteStatus::Deposited)
+                .unwrap();
+        }
+        let count = |f: NoteFilter| db.select(&f).len();
+        assert_eq!(count(NoteFilter::default()), 4);
+        assert_eq!(
+            count(NoteFilter {
+                chain_id: Some(1),
+                ..Default::default()
+            }),
+            3
+        );
+        assert_eq!(
+            count(NoteFilter {
+                currency: Some("ETH".into()),
+                ..Default::default()
+            }),
+            3
+        );
+        assert_eq!(
+            count(NoteFilter {
+                amount: Some("0.10".into()),
+                ..Default::default()
+            }),
+            2
+        );
+        assert_eq!(
+            count(NoteFilter {
+                chain_id: Some(1),
+                currency: Some("eth".into()),
+                amount: Some("0.1".into()),
+            }),
+            1
+        );
+        assert_eq!(
+            count(NoteFilter {
+                chain_id: Some(56),
+                ..Default::default()
+            }),
+            0
+        );
     }
 
     #[test]
