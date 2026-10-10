@@ -114,6 +114,25 @@ impl DepositEstimate {
     }
 }
 
+/// Gas and fee prices for one transaction, estimated before it is sent.
+#[derive(Clone, Copy, Debug)]
+pub struct TxEstimate {
+    pub gas: u64,
+    pub fees: GasFees,
+}
+
+impl TxEstimate {
+    /// Expected fee in the native coin's base units.
+    pub fn fee(&self) -> U256 {
+        U256::from(self.gas) * U256::from(self.fees.gas_price)
+    }
+
+    /// Fee if the transaction paid its max fee per gas.
+    pub fn max_fee(&self) -> U256 {
+        U256::from(self.gas) * U256::from(self.fees.max_fee_per_gas)
+    }
+}
+
 fn receipt_fee(r: &TransactionReceipt) -> U256 {
     U256::from(r.gas_used) * U256::from(r.effective_gas_price)
 }
@@ -767,12 +786,15 @@ impl TornadoClient {
         Ok(())
     }
 
-    /// Submit a withdrawal from this client's own account.
-    pub async fn withdraw(&self, pool: &Pool, w: &WithdrawProof) -> Result<B256> {
-        self.sender()?;
+    fn withdraw_request(
+        &self,
+        pool: &Pool,
+        w: &WithdrawProof,
+        from: Address,
+    ) -> TransactionRequest {
         let a = &w.args;
         let instance = ITornadoInstance::new(pool.address, &self.provider);
-        let call = instance
+        instance
             .withdraw(
                 Bytes::copy_from_slice(&w.proof_bytes()),
                 a.root,
@@ -782,14 +804,44 @@ impl TornadoClient {
                 a.fee,
                 a.refund,
             )
-            .value(a.refund);
-        let pending = call.send().await.map_err(eth_err)?;
+            .value(a.refund)
+            .from(from)
+            .into_transaction_request()
+    }
+
+    /// Estimate the gas and fee of sending withdrawal `w` from this client's
+    /// own account. Sends nothing.
+    pub async fn estimate_withdraw(&self, pool: &Pool, w: &WithdrawProof) -> Result<TxEstimate> {
+        let tx = self.withdraw_request(pool, w, self.sender()?);
+        let gas = self.provider.estimate_gas(tx).await.map_err(eth_err)?;
+        Ok(TxEstimate {
+            gas,
+            fees: self.fees().await?,
+        })
+    }
+
+    /// Submit a withdrawal from this client's own account.
+    pub async fn withdraw(&self, pool: &Pool, w: &WithdrawProof) -> Result<B256> {
+        let tx = self.withdraw_request(pool, w, self.sender()?);
+        let pending = self.provider.send_transaction(tx).await.map_err(eth_err)?;
         let tx = *pending.tx_hash();
         let r = pending.get_receipt().await.map_err(eth_err)?;
         if !r.status() {
             return Err(Error::Eth(format!("withdraw transaction {tx:#x} reverted")));
         }
         Ok(tx)
+    }
+
+    /// Gas used by mined transaction `tx` and the fee it paid, in the native
+    /// coin's base units.
+    pub async fn tx_cost(&self, tx: B256) -> Result<(u64, U256)> {
+        let r = self
+            .provider
+            .get_transaction_receipt(tx)
+            .await
+            .map_err(eth_err)?
+            .ok_or_else(|| Error::Eth(format!("no receipt for {tx:#x}")))?;
+        Ok((r.gas_used, receipt_fee(&r)))
     }
 }
 

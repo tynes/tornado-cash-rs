@@ -92,7 +92,8 @@ relayers; the CLI warns when you use them.
   *before* it is broadcast, and removed again only if the deposit is rejected or reverts.
 * **Deposits** print the estimated gas and fee (approvals included for ERC-20 pools) and ask before sending;
   `--yes`/`-y` skips the prompt and is required when stdin is not a terminal. The gas used and fee paid are
-  printed afterwards.
+  printed afterwards. Withdrawals do the same: self-relayed ones show the estimated gas and fee (after the proof
+  is generated, since the estimate needs it), relayed ones show the relayer's fee.
 * **Event sync** pulls `Deposit` events with chunked `eth_getLogs` (span halves on RPC errors) into a
   plaintext cache of public commitments under the data directory.
 

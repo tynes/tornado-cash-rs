@@ -16,7 +16,7 @@ use tornado_cash_rs::chains::{all_chains, chain_by_id, format_units, parse_units
 use tornado_cash_rs::db::{NoteDb, NoteStatus};
 use tornado_cash_rs::error::Error;
 use tornado_cash_rs::eth::{
-    self, build_tree, sync_deposits, DepositCache, SyncOptions, TornadoClient,
+    self, build_tree, sync_deposits, DepositCache, GasFees, SyncOptions, TornadoClient,
 };
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::Prover;
@@ -142,7 +142,7 @@ enum Cmd {
         #[arg(long)]
         calldata: bool,
     },
-    /// Withdraw a note to a recipient, through a relayer or from your own account.
+    /// Withdraw a note to a recipient, through a relayer or from your own account. Shows the fee and asks before sending.
     Withdraw {
         /// Note id (or unique prefix) from `notes list`.
         id: String,
@@ -156,7 +156,7 @@ enum Cmd {
         /// ERC-20 pools only: native coin the relayer should send the recipient, e.g. 0.01.
         #[arg(long)]
         refund: Option<String>,
-        /// Skip the confirmation prompt.
+        /// Send without asking for confirmation (required when stdin is not a terminal).
         #[arg(long, short)]
         yes: bool,
         /// Print the withdrawal calldata for another account (e.g. a Safe) to send
@@ -362,6 +362,17 @@ fn gwei(wei: u128) -> String {
     approx_units(U256::from(wei), 9)
 }
 
+/// Print an estimate's gas and fee lines, as shown before a confirmation.
+fn print_estimate(gas: u64, fees: &GasFees, fee: U256, max_fee: U256, coin: &str) {
+    println!("  Gas:   {gas} (estimated)");
+    println!(
+        "  Fee:   ~{} {coin} at {} gwei (at most {} {coin})",
+        approx_units(fee, 18),
+        gwei(fees.gas_price),
+        approx_units(max_fee, 18)
+    );
+}
+
 /// Say where requests will physically go, since the per-request log lines
 /// show only their final destination.
 fn log_route(proxy: Option<&str>) {
@@ -544,13 +555,7 @@ async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<(
                 .join(" + ")
         );
     }
-    println!("  Gas:   {} (estimated)", est.gas());
-    println!(
-        "  Fee:   ~{} {coin} at {} gwei (at most {} {coin})",
-        approx_units(est.fee(), 18),
-        gwei(est.fees.gas_price),
-        approx_units(est.max_fee(), 18)
-    );
+    print_estimate(est.gas(), &est.fees, est.fee(), est.max_fee(), coin);
     confirm(yes, "Send the deposit?")?;
 
     // Persist the secret before the deposit is broadcast, so a crash after
@@ -723,6 +728,7 @@ async fn withdraw(
         return Ok(());
     }
 
+    let coin = client.chain.native_symbol;
     let tx = if let Some(url) = relayer {
         let rc = RelayerClient::new(&url, Some(app.http.clone()))?;
         let status = rc.status().await?;
@@ -731,18 +737,19 @@ async fn withdraw(
         }
         let gas_price = client.gas_price().await?;
         let fee = RelayerClient::quote_fee(&status, &pool, gas_price, refund)?;
-        confirm(
-            yes,
-            &format!(
-                "Withdraw {} {} to {recipient} via {} (fee {} {}, relayer {})?",
-                pool.amount,
-                pool.currency.to_uppercase(),
-                url,
-                format_units(fee, pool.decimals),
-                pool.currency.to_uppercase(),
-                status.reward_account
-            ),
-        )?;
+        println!(
+            "Withdraw {} {} to {recipient} via {url} (relayer {})",
+            pool.amount,
+            pool.currency.to_uppercase(),
+            status.reward_account
+        );
+        println!(
+            "  Fee:   {} {} to the relayer, which pays the gas (at {} gwei)",
+            format_units(fee, pool.decimals),
+            pool.currency.to_uppercase(),
+            gwei(gas_price)
+        );
+        confirm(yes, "Send the withdrawal?")?;
         eprintln!("Generating proof...");
         let proof = prover.prove_withdrawal(
             &rec.note,
@@ -757,15 +764,7 @@ async fn withdraw(
         rc.wait(&job, |j| eprintln!("  relayer: {}", j.status))
             .await?
     } else {
-        confirm(
-            yes,
-            &format!(
-                "Withdraw {} {} to {recipient}, paying gas from {}?",
-                pool.amount,
-                pool.currency.to_uppercase(),
-                client.sender()?
-            ),
-        )?;
+        // The gas can only be estimated with a valid proof, so prove first.
         eprintln!("Generating proof...");
         let proof = prover.prove_withdrawal(
             &rec.note,
@@ -775,6 +774,15 @@ async fn withdraw(
             U256::ZERO,
             U256::ZERO,
         )?;
+        let est = client.estimate_withdraw(&pool, &proof).await?;
+        println!(
+            "Withdraw {} {} to {recipient}, paying gas from {}",
+            pool.amount,
+            pool.currency.to_uppercase(),
+            client.sender()?
+        );
+        print_estimate(est.gas, &est.fees, est.fee(), est.max_fee(), coin);
+        confirm(yes, "Send the withdrawal?")?;
         client.withdraw(&pool, &proof).await?
     };
 
@@ -796,6 +804,19 @@ async fn withdraw(
         r.withdraw_recipient = Some(recipient);
     })?;
     println!("Withdrew note {} in {}", rec.id, client.tx_url(&tx));
+    match client.tx_cost(tx).await {
+        Ok((gas, fee)) if self_relay => {
+            println!(
+                "Gas used: {gas}, fee paid: {} {coin}",
+                approx_units(fee, 18)
+            )
+        }
+        Ok((gas, fee)) => println!(
+            "Gas used: {gas}, paid by the relayer: {} {coin}",
+            approx_units(fee, 18)
+        ),
+        Err(e) => eprintln!("could not read the withdrawal's gas use: {e}"),
+    }
     Ok(())
 }
 

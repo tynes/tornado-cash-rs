@@ -268,10 +268,18 @@ async fn self_relayed_withdraw() {
         U256::ZERO,
     )
     .await;
-    let sender = fork.client(Some(fork.funded_signer(ether(1)).await)).await;
-    sender.withdraw(&pool, &proof).await.unwrap();
+    let signer = fork.funded_signer(ether(1)).await;
+    let from = signer.address();
+    let sender = fork.client(Some(signer)).await;
+    let est = sender.estimate_withdraw(&pool, &proof).await.unwrap();
+    assert!(est.fee() <= est.max_fee());
+    let tx = sender.withdraw(&pool, &proof).await.unwrap();
 
     assert_eq!(fork.balance(recipient).await, pool.denomination());
+    // The reported cost is exactly what the sender paid.
+    let (gas_used, fee) = sender.tx_cost(tx).await.unwrap();
+    assert_eq!(ether(1) - fork.balance(from).await, fee);
+    assert_close(est.gas, gas_used);
     assert!(reader
         .is_spent(&pool, note.nullifier_hash_bytes())
         .await
