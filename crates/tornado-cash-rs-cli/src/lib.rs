@@ -341,8 +341,24 @@ impl App {
 fn confirm(yes: bool, msg: &str) -> Result<()> {
     let stdin = std::io::stdin();
     let interactive = stdin.is_terminal();
+    if interactive && !yes {
+        discard_typeahead();
+    }
     confirm_from(yes, msg, interactive, &mut stdin.lock())
 }
+
+/// Drop whatever was typed while the CLI was busy (syncing, proving), such
+/// as an impatient Enter, so the prompt reads only the answer typed after it.
+#[cfg(unix)]
+fn discard_typeahead() {
+    // SAFETY: tcflush only touches the terminal's input queue for fd 0.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+#[cfg(not(unix))]
+fn discard_typeahead() {}
 
 /// Ask `msg` on stderr and read the answer from `input`. Without a terminal
 /// nobody can answer, so refuse rather than hang or read a stray "y".
@@ -357,8 +373,9 @@ fn confirm_from(yes: bool, msg: &str, interactive: bool, input: &mut impl BufRea
     std::io::stderr().flush()?;
     let mut s = String::new();
     input.read_line(&mut s)?;
-    if !matches!(s.trim(), "y" | "Y" | "yes") {
-        bail!("aborted");
+    let answer = s.trim();
+    if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
+        bail!("aborted (answered {answer:?}; type y to confirm)");
     }
     Ok(())
 }
@@ -1074,10 +1091,11 @@ mod tests {
     fn confirm_reads_the_answer() {
         confirm_from(false, "go?", true, &mut &b"y\n"[..]).unwrap();
         confirm_from(false, "go?", true, &mut &b"yes\n"[..]).unwrap();
+        confirm_from(false, "go?", true, &mut &b"YES\r\n"[..]).unwrap();
         for answer in [&b"\n"[..], b"n\n", b""] {
             let mut input = answer;
             let err = confirm_from(false, "go?", true, &mut input).unwrap_err();
-            assert_eq!(err.to_string(), "aborted");
+            assert!(err.to_string().starts_with("aborted"), "{err}");
         }
     }
 
