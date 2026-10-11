@@ -24,12 +24,18 @@ PRIVATE_KEY=0x... tornado-rs deposit eth 0.1
 tornado-rs deposit eth 0.1 --ledger                      # or sign on a Ledger
 tornado-rs balances
 tornado-rs notes list
-tornado-rs withdraw <note-id> 0xRecipient --relayer https://relayer.example
+tornado-rs withdraw <note-id> 0xRecipient --relay      # through the most-staked public relayer
+tornado-rs withdraw <note-id> 0xRecipient --relayer https://relayer.example   # or one you pick
 tornado-rs withdraw <note-id> 0xRecipient --self-relay   # pays gas from PRIVATE_KEY's account
 tornado-rs withdraw <note-id> 0xRecipient --calldata     # prints the call for another account to send
 tornado-rs notes import tornado-eth-0.1-1-0x...          # bring in tornado-cli notes
 tornado-rs stats                                         # deposit counts per pool
 ```
+
+`withdraw --relay` uses the registered relayer with the most TORN staked in the Relayer Registry for the
+RPC's chain (on mainnet, `eth.reltor.su`), and tries the next ones in stake order if it does not answer.
+`tornado-rs withdraw --help` lists them. The list is a snapshot baked into the binary, so `--relayer <url>`
+is how to reach any other relayer.
 
 `deposit --calldata` and `withdraw --calldata` send nothing: they print only the `0x` calldata on stdout, so it
 can be nested in another tool's command (for example a Safe CLI), and print the target pool and the value to send
@@ -62,7 +68,7 @@ INFO tornado_cash_rs::net: GET https://raw.githubusercontent.com/…/tornado.jso
 RPC URLs are shown as origin only (`/…`), since they often carry an API key. `--log-network=full` also prints
 request and response bodies: RPC parameters and results, signed transactions, relayer requests with the
 proof and recipient. Treat that output as sensitive. The CLI talks only to the RPC endpoint, the relayer you
-pass, and `raw.githubusercontent.com` for the proving artifacts. For connection-level detail (DNS, TLS,
+pass (or the known relayers `--relay` tries), and `raw.githubusercontent.com` for the proving artifacts. For connection-level detail (DNS, TLS,
 connection reuse), add `TORNADO_RS_LOG=hyper_util=debug,reqwest=debug`.
 
 ## Supported chains
