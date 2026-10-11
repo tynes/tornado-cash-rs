@@ -22,14 +22,15 @@ use tornado_cash_rs::eth::{
 };
 use tornado_cash_rs::note::Note;
 use tornado_cash_rs::prover::Prover;
-use tornado_cash_rs::relayer::RelayerClient;
+use tornado_cash_rs::relayer::{known_relayers, RelayerClient, RELAYER_SNAPSHOT_BLOCK};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
     name = "tornado-rs",
     version,
-    about = "Deposit to and withdraw from Tornado Cash Classic pools"
+    about = "Deposit to and withdraw from Tornado Cash Classic pools",
+    after_help = default_relayer_help()
 )]
 pub struct Cli {
     /// Directory for the note database, event cache and proving artifacts
@@ -145,15 +146,20 @@ enum Cmd {
         calldata: bool,
     },
     /// Withdraw a note to a recipient, through a relayer or from your own account. Shows the fee and asks before sending.
+    #[command(after_help = known_relayers_help())]
     Withdraw {
         /// Note id (or unique prefix) from `notes list`.
         id: String,
         recipient: Address,
-        /// Relayer URL. Without it you must pass --self-relay or --calldata.
+        /// Send through the most-staked public relayer for the RPC's chain (listed below),
+        /// falling back to the next one if it does not answer.
         #[arg(long)]
+        relay: bool,
+        /// Send through this relayer URL instead of the default (implies --relay).
+        #[arg(long, value_name = "URL")]
         relayer: Option<String>,
         /// Send the withdrawal from your own account (PRIVATE_KEY or --ledger) (links that account to the withdrawal).
-        #[arg(long, conflicts_with = "relayer")]
+        #[arg(long, conflicts_with_all = ["relay", "relayer"])]
         self_relay: bool,
         /// ERC-20 pools only: native coin the relayer should send the recipient, e.g. 0.01.
         #[arg(long)]
@@ -163,7 +169,7 @@ enum Cmd {
         yes: bool,
         /// Print the withdrawal calldata for another account (e.g. a Safe) to send
         /// instead of sending it. The pool address and value go to stderr.
-        #[arg(long, conflicts_with_all = ["relayer", "self_relay", "refund"])]
+        #[arg(long, conflicts_with_all = ["relay", "relayer", "self_relay", "refund"])]
         calldata: bool,
     },
     /// Show balances from the local note database.
@@ -504,12 +510,18 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Withdraw {
             id,
             recipient,
+            relay,
             relayer,
             self_relay,
             refund,
             yes,
             calldata,
         } => {
+            let relayer = match relayer {
+                Some(url) => Some(RelayerChoice::Url(url)),
+                None if relay => Some(RelayerChoice::Default),
+                None => None,
+            };
             withdraw(
                 &app, &id, recipient, relayer, self_relay, refund, yes, calldata,
             )
@@ -679,14 +691,14 @@ async fn withdraw(
     app: &App,
     id: &str,
     recipient: Address,
-    relayer: Option<String>,
+    relayer: Option<RelayerChoice>,
     self_relay: bool,
     refund: Option<String>,
     yes: bool,
     calldata: bool,
 ) -> Result<()> {
     if relayer.is_none() && !self_relay && !calldata {
-        bail!("pass --relayer <url>, --self-relay to pay gas from your own account (which links it to this withdrawal), or --calldata to print the call for another account to send");
+        bail!("pass --relay to use the default relayer (or --relayer <url> for another), --self-relay to pay gas from your own account (which links it to this withdrawal), or --calldata to print the call for another account to send");
     }
     let mut db = app.open_db()?;
     // The local status is only a hint; the chain decides whether the note is spent.
@@ -766,12 +778,8 @@ async fn withdraw(
     }
 
     let coin = client.chain.native_symbol;
-    let tx = if let Some(url) = relayer {
-        let rc = RelayerClient::new(&url, Some(app.http.clone()))?;
-        let status = rc.status().await?;
-        if !status.serves_chain(client.chain.chain_id) {
-            bail!("relayer does not serve {}", client.chain.name);
-        }
+    let tx = if let Some(choice) = relayer {
+        let (url, rc, status) = pick_relayer(app, choice, &client.chain).await?;
         let gas_price = client.gas_price().await?;
         let fee = RelayerClient::quote_fee(&status, &pool, gas_price, refund)?;
         println!(
@@ -855,6 +863,97 @@ async fn withdraw(
         Err(e) => eprintln!("could not read the withdrawal's gas use: {e}"),
     }
     Ok(())
+}
+
+/// How `withdraw` should find its relayer.
+enum RelayerChoice {
+    /// The known relayers for the chain, most staked first.
+    Default,
+    /// A URL the user gave.
+    Url(String),
+}
+
+/// Connect to the chosen relayer and check it serves `chain`. For the default,
+/// try each known relayer in stake order until one answers.
+async fn pick_relayer(
+    app: &App,
+    choice: RelayerChoice,
+    chain: &tornado_cash_rs::chains::Chain,
+) -> Result<(
+    String,
+    RelayerClient,
+    tornado_cash_rs::relayer::RelayerStatus,
+)> {
+    let urls: Vec<String> = match choice {
+        RelayerChoice::Url(url) => {
+            let rc = RelayerClient::new(&url, Some(app.http.clone()))?;
+            let status = rc.status().await?;
+            if !status.serves_chain(chain.chain_id) {
+                bail!("relayer does not serve {}", chain.name);
+            }
+            return Ok((url, rc, status));
+        }
+        RelayerChoice::Default => known_relayers(chain.chain_id)
+            .iter()
+            .map(|r| r.url.to_string())
+            .collect(),
+    };
+    if urls.is_empty() {
+        bail!(
+            "no known relayer for {}; pass --relayer <url>, --self-relay or --calldata",
+            chain.name
+        );
+    }
+    for url in urls {
+        let rc = RelayerClient::new(&url, Some(app.http.clone()))?;
+        match rc.status().await {
+            Ok(status) if status.serves_chain(chain.chain_id) => return Ok((url, rc, status)),
+            Ok(_) => eprintln!(
+                "warning: {url} does not serve {}; trying the next relayer",
+                chain.name
+            ),
+            Err(e) => eprintln!("warning: {url} did not answer ({e}); trying the next relayer"),
+        }
+    }
+    bail!(
+        "none of the known relayers for {} answered; pass --relayer <url>, --self-relay or --calldata",
+        chain.name
+    )
+}
+
+/// Top-level help: the mainnet default and where to find the rest.
+fn default_relayer_help() -> String {
+    let d = &known_relayers(1)[0];
+    format!(
+        "Withdrawals with --relay use the relayer with the most TORN staked: on mainnet {} ({}).\n\
+         `tornado-rs withdraw --help` lists the known relayers for every chain.",
+        d.url, d.ens
+    )
+}
+
+/// `withdraw --help`: every known relayer, grouped by chain.
+fn known_relayers_help() -> String {
+    let mut s = format!(
+        "Known relayers, by TORN staked in the Relayer Registry (read at mainnet block {RELAYER_SNAPSHOT_BLOCK}).\n\
+         --relay uses the first one for the RPC's chain and falls back down the list:\n"
+    );
+    for c in all_chains() {
+        let rs = known_relayers(c.chain_id);
+        s.push_str(&format!("\n  {}:\n", c.name));
+        if rs.is_empty() {
+            s.push_str("    none; use --relayer <url> or --self-relay\n");
+        }
+        for (i, r) in rs.iter().enumerate() {
+            s.push_str(&format!(
+                "    {:<38} {:<24} {:>6} TORN{}\n",
+                r.url,
+                r.ens,
+                r.stake,
+                if i == 0 { "  (default)" } else { "" }
+            ));
+        }
+    }
+    s
 }
 
 async fn balances(app: &App, check: bool) -> Result<()> {
@@ -1107,5 +1206,22 @@ mod tests {
         assert_eq!(approx_units(wei("0.000000123"), 18), "0.000000123");
         assert_eq!(approx_units(U256::ZERO, 18), "0");
         assert_eq!(gwei(12_345_678_901), "12.35");
+    }
+
+    #[test]
+    fn relay_flags() {
+        let to = "0x0000000000000000000000000000000000000001";
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["tornado-rs", "withdraw", "abc", to];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        parse(&["--relay"]).unwrap();
+        parse(&["--relayer", "https://relayer.example"]).unwrap();
+        parse(&["--relay", "--relayer", "https://relayer.example"]).unwrap();
+        assert!(parse(&["--relay", "--self-relay"]).is_err());
+        assert!(parse(&["--relay", "--calldata"]).is_err());
+        assert!(known_relayers_help().contains("eth.reltor.su"));
+        assert!(default_relayer_help().contains("eth.reltor.su"));
     }
 }

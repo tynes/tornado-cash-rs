@@ -11,6 +11,108 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// A public relayer from the on-chain Relayer Registry.
+#[derive(Clone, Copy, Debug)]
+pub struct KnownRelayer {
+    /// The relayer's ENS name in the registry.
+    pub ens: &'static str,
+    /// The `url` text record of `<chain>-tornado.<ens>`.
+    pub url: &'static str,
+    /// TORN staked in the registry, rounded down.
+    pub stake: u32,
+}
+
+/// Mainnet block the [`known_relayers`] snapshot was read at.
+pub const RELAYER_SNAPSHOT_BLOCK: u64 = 26_166_543;
+
+const fn r(ens: &'static str, url: &'static str, stake: u32) -> KnownRelayer {
+    KnownRelayer { ens, url, stake }
+}
+
+/// Relayers registered in the Relayer Registry (relayer-registry.eth,
+/// 0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2) that served `/status` for the
+/// chain at [`RELAYER_SNAPSHOT_BLOCK`], most TORN staked first. The official
+/// UI picks relayers weighted by that stake, so the first is the most used.
+/// Empty for chains with no live registered relayer (Sepolia).
+pub fn known_relayers(chain_id: u64) -> &'static [KnownRelayer] {
+    match chain_id {
+        1 => {
+            const L: &[KnownRelayer] = &[
+                r("reltor.eth", "https://eth.reltor.su", 42_943),
+                r("safe-torn.eth", "https://eth3.safetorn.ovh", 26_604),
+                r("00relayer.eth", "https://eth.00relayer.xyz", 17_148),
+                r("sky-relayer.eth", "https://sky-relayer.xyz", 14_630),
+                r(
+                    "master-relayer.eth",
+                    "https://eth.master-relayer.com",
+                    12_263,
+                ),
+            ];
+            L
+        }
+        56 => {
+            const L: &[KnownRelayer] = &[
+                r("reltor.eth", "https://binance.reltor.su", 42_943),
+                r("safe-torn.eth", "https://bsc3.safetorn.ovh", 26_604),
+                r("00relayer.eth", "https://bsc.00relayer.xyz", 17_148),
+            ];
+            L
+        }
+        100 => {
+            const L: &[KnownRelayer] = &[
+                r("torntool.eth", "https://gnosis.theavengers.me", 5_332),
+                r(
+                    "dieguis-and-martis.eth",
+                    "https://gnosis.dieguis-and-martis.xyz",
+                    995,
+                ),
+            ];
+            L
+        }
+        137 => {
+            const L: &[KnownRelayer] = &[
+                r("reltor.eth", "https://polygon.reltor.su", 42_943),
+                r("safe-torn.eth", "https://poly3.safetorn.ovh", 26_604),
+                r("hello-relayer.eth", "https://polygon.hirelay04.xyz", 9_764),
+            ];
+            L
+        }
+        42161 => {
+            const L: &[KnownRelayer] = &[
+                r("safe-torn.eth", "https://arb3.safetorn.ovh", 26_604),
+                r("torn-city.eth", "https://arb.torncity.fun", 9_420),
+                r("torntool.eth", "https://arb.theavengers.me", 5_332),
+            ];
+            L
+        }
+        10 => {
+            const L: &[KnownRelayer] = &[
+                r("torntool.eth", "https://op.theavengers.me", 5_332),
+                r(
+                    "dieguis-and-martis.eth",
+                    "https://op.dieguis-and-martis.xyz",
+                    995,
+                ),
+                r("bitah.eth", "https://optimism-tornado.bitah.link", 739),
+            ];
+            L
+        }
+        43114 => {
+            const L: &[KnownRelayer] = &[
+                r("hello-relayer.eth", "https://avax.hirelay04.xyz", 9_764),
+                r("torntool.eth", "https://avax.theavengers.me", 5_332),
+                r(
+                    "dieguis-and-martis.eth",
+                    "https://avax.dieguis-and-martis.xyz",
+                    995,
+                ),
+            ];
+            L
+        }
+        _ => &[],
+    }
+}
+
 /// Gas budgeted for a relayed withdrawal when quoting the fee (tornado-cli uses the same).
 pub const WITHDRAW_GAS_LIMIT: u64 = 500_000;
 
@@ -224,5 +326,20 @@ mod tests {
         // 0.005 ETH at 0.0005 ETH/DAI = 10 DAI, plus 0.3 DAI
         let fee = RelayerClient::quote_fee(&status(0.3), p, 10_000_000_000, U256::ZERO).unwrap();
         assert_eq!(fee, U256::from(10_300_000_000_000_000_000u128));
+    }
+
+    #[test]
+    fn known_relayers_sorted_by_stake() {
+        for c in crate::chains::all_chains() {
+            let rs = known_relayers(c.chain_id);
+            assert!(
+                rs.windows(2).all(|w| w[0].stake >= w[1].stake),
+                "{}",
+                c.name
+            );
+            assert!(rs.iter().all(|r| r.url.starts_with("https://")));
+        }
+        assert_eq!(known_relayers(1)[0].ens, "reltor.eth");
+        assert!(known_relayers(11155111).is_empty());
     }
 }
