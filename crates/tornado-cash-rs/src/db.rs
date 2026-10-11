@@ -109,6 +109,10 @@ pub struct NoteRecord {
     pub deposit_block: Option<u64>,
     #[serde(default)]
     pub leaf_index: Option<u32>,
+    /// Account that sent the deposit, when this CLI sent it. Unknown for
+    /// imported notes and `deposit --calldata`.
+    #[serde(default)]
+    pub depositor: Option<Address>,
     #[serde(default)]
     pub withdraw_tx: Option<B256>,
     #[serde(default)]
@@ -369,6 +373,7 @@ impl NoteDb {
             deposit_tx: None,
             deposit_block: None,
             leaf_index: None,
+            depositor: None,
             withdraw_tx: None,
             withdraw_recipient: None,
         });
@@ -580,6 +585,28 @@ mod tests {
             .unwrap();
         drop(deposit);
         assert_eq!(NoteDb::open(&path, "pw").unwrap().notes().len(), 1);
+    }
+
+    #[test]
+    fn records_without_a_depositor_still_load() {
+        let mut rec = serde_json::to_value(NoteRecord {
+            id: "00".into(),
+            note: Note::random(1, "eth", "0.1"),
+            pool: Address::ZERO,
+            status: NoteStatus::Deposited,
+            created_at: 0,
+            label: None,
+            deposit_tx: None,
+            deposit_block: None,
+            leaf_index: None,
+            depositor: Some(Address::repeat_byte(1)),
+            withdraw_tx: None,
+            withdraw_recipient: None,
+        })
+        .unwrap();
+        rec.as_object_mut().unwrap().remove("depositor");
+        let rec: NoteRecord = serde_json::from_value(rec).unwrap();
+        assert_eq!(rec.depositor, None);
     }
 
     #[test]

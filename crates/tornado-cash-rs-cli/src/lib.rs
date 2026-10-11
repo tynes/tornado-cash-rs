@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use tornado_cash_rs::chains::{
     all_chains, chain_by_id, chain_by_name, format_units, parse_units, Tier,
 };
-use tornado_cash_rs::db::{NoteDb, NoteFilter, NoteStatus};
+use tornado_cash_rs::db::{NoteDb, NoteFilter, NoteRecord, NoteStatus};
 use tornado_cash_rs::error::Error;
 use tornado_cash_rs::eth::{
     self, build_tree, sync_deposits, DepositCache, GasFees, SyncOptions, TornadoClient,
@@ -399,6 +399,34 @@ fn gwei(wei: u128) -> String {
     approx_units(U256::from(wei), 9)
 }
 
+/// A warning when `recipient` (or the account paying gas) is the account that
+/// made the deposit, which publicly links the deposit to the withdrawal.
+/// Notes with no recorded depositor are not checked.
+fn linked_address_warning(
+    rec: &NoteRecord,
+    recipient: Address,
+    gas_payer: Option<Address>,
+) -> Option<String> {
+    let depositor = rec.depositor?;
+    let what = match (recipient == depositor, gas_payer == Some(depositor)) {
+        (true, true) => "the recipient and the account paying gas are",
+        (true, false) => "the recipient is",
+        (false, true) => "the account paying gas is",
+        (false, false) => return None,
+    };
+    Some(format!(
+        "WARNING: {what} {depositor}, the account that deposited note {}. \
+         Anyone can link this withdrawal to that deposit, so it gets no privacy.",
+        rec.id
+    ))
+}
+
+fn warn_if_linked(rec: &NoteRecord, recipient: Address, gas_payer: Option<Address>) {
+    if let Some(w) = linked_address_warning(rec, recipient, gas_payer) {
+        eprintln!("{w}");
+    }
+}
+
 /// Print an estimate's gas and fee lines, as shown before a confirmation.
 fn print_estimate(gas: u64, fees: &GasFees, fee: U256, max_fee: U256, coin: &str) {
     println!("  Gas:   {gas} (estimated)");
@@ -601,7 +629,10 @@ async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<(
     let result = client
         .deposit_with(&pool, &note, |tx| {
             let id = db.insert(note.clone(), pool.address, NoteStatus::Pending)?;
-            db.update(&id, |rec| rec.deposit_tx = Some(tx))?;
+            db.update(&id, |rec| {
+                rec.deposit_tx = Some(tx);
+                rec.depositor = Some(from);
+            })?;
             saved = Some(id);
             Ok(())
         })
@@ -757,6 +788,7 @@ async fn withdraw(
             pool.currency.to_uppercase(),
             pool.address
         );
+        warn_if_linked(&rec, recipient, None);
         eprintln!(
             "Once it is mined, run `tornado-rs balances --check` to mark note {} spent.",
             rec.id
@@ -786,6 +818,7 @@ async fn withdraw(
             pool.currency.to_uppercase(),
             gwei(gas_price)
         );
+        warn_if_linked(&rec, recipient, None);
         confirm(yes, "Send the withdrawal?")?;
         eprintln!("Generating proof...");
         let proof = prover.prove_withdrawal(
@@ -819,6 +852,7 @@ async fn withdraw(
             client.sender()?
         );
         print_estimate(est.gas, &est.fees, est.fee(), est.max_fee(), coin);
+        warn_if_linked(&rec, recipient, Some(client.sender()?));
         confirm(yes, "Send the withdrawal?")?;
         client.withdraw(&pool, &proof).await?
     };
@@ -1097,6 +1131,46 @@ mod tests {
             let err = confirm_from(false, "go?", true, &mut input).unwrap_err();
             assert!(err.to_string().starts_with("aborted"), "{err}");
         }
+    }
+
+    #[test]
+    fn warns_when_withdrawing_to_the_depositor() {
+        let depositor = Address::repeat_byte(0xaa);
+        let other = Address::repeat_byte(0xbb);
+        let mut rec = NoteRecord {
+            id: "1234abcd".into(),
+            note: Note::random(1, "eth", "0.1"),
+            pool: Address::ZERO,
+            status: NoteStatus::Deposited,
+            created_at: 0,
+            label: None,
+            deposit_tx: None,
+            deposit_block: None,
+            leaf_index: None,
+            depositor: None,
+            withdraw_tx: None,
+            withdraw_recipient: None,
+        };
+        // Notes without a recorded depositor are not checked.
+        assert_eq!(
+            linked_address_warning(&rec, depositor, Some(depositor)),
+            None
+        );
+
+        rec.depositor = Some(depositor);
+        assert_eq!(linked_address_warning(&rec, other, None), None);
+        assert_eq!(linked_address_warning(&rec, other, Some(other)), None);
+        let w = linked_address_warning(&rec, depositor, None).unwrap();
+        assert!(w.contains("the recipient is"), "{w}");
+        assert!(w.contains(&depositor.to_string()), "{w}");
+        assert!(w.contains("1234abcd"), "{w}");
+        let w = linked_address_warning(&rec, other, Some(depositor)).unwrap();
+        assert!(w.contains("the account paying gas is"), "{w}");
+        let w = linked_address_warning(&rec, depositor, Some(depositor)).unwrap();
+        assert!(
+            w.contains("the recipient and the account paying gas are"),
+            "{w}"
+        );
     }
 
     #[test]
