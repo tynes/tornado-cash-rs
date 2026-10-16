@@ -84,6 +84,8 @@ async fn deposit_sync_withdraw_self_relay() {
     assert_eq!(rec.status, NoteStatus::Deposited);
     assert_eq!(rec.leaf_index, Some(next));
     assert!(rec.deposit_tx.is_some());
+    assert!(rec.deposit_block.is_some());
+    assert!(rec.deposit_time.is_some_and(|t| t > 0));
     assert_eq!(rec.pool, pool.address);
 
     // The new deposit is fewer than 64 blocks deep, so sync reads it but
@@ -108,6 +110,9 @@ async fn deposit_sync_withdraw_self_relay() {
     let rec = notes(d).pop().unwrap();
     assert_eq!(rec.status, NoteStatus::Spent);
     assert_eq!(rec.withdraw_recipient, Some(recipient));
+    assert!(rec.withdraw_tx.is_some());
+    assert!(rec.withdraw_block.is_some());
+    assert!(rec.withdraw_time >= rec.deposit_time);
     assert_eq!(fork.balance(recipient).await, pool.denomination());
 
     // A spent note is refused before anything is sent.
