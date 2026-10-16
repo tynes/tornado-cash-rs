@@ -226,6 +226,10 @@ impl RelayerClient {
         if fee >= total {
             return Err(Error::Relayer("relayer fee exceeds the note amount".into()));
         }
+        tracing::debug!(
+            "relayer fee {fee} = gas {expense} (gas price {gas_price}) + service fee {fee_percent} ({}%), refund {refund}",
+            status.tornado_service_fee
+        );
         Ok(fee)
     }
 
@@ -259,10 +263,13 @@ impl RelayerClient {
                 .unwrap_or("request rejected");
             return Err(Error::Relayer(format!("{status}: {msg}")));
         }
-        v.get("id")
+        let id = v
+            .get("id")
             .and_then(|i| i.as_str())
             .map(str::to_string)
-            .ok_or_else(|| Error::Relayer("relayer did not return a job id".into()))
+            .ok_or_else(|| Error::Relayer("relayer did not return a job id".into()))?;
+        tracing::info!("relayer accepted withdrawal job {id}");
+        Ok(id)
     }
 
     pub async fn job(&self, id: &str) -> Result<JobStatus> {
@@ -275,6 +282,7 @@ impl RelayerClient {
     pub async fn wait(&self, id: &str, mut on_update: impl FnMut(&JobStatus)) -> Result<B256> {
         loop {
             let j = self.job(id).await?;
+            tracing::debug!("relayer job {id}: {}", j.status);
             on_update(&j);
             match j.status.as_str() {
                 "CONFIRMED" => {
