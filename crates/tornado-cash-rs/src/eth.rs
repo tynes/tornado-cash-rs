@@ -68,6 +68,8 @@ fn eth_err(e: impl std::fmt::Display) -> Error {
 pub struct DepositReceipt {
     pub tx_hash: B256,
     pub block_number: u64,
+    /// Timestamp of that block, in Unix seconds (from the Deposit event).
+    pub timestamp: u64,
     pub leaf_index: u32,
     /// Gas used by the deposit and any ERC-20 approvals sent before it.
     pub gas_used: u64,
@@ -704,19 +706,19 @@ impl TornadoClient {
             )));
         }
         let commitment = note.commitment_bytes();
-        let leaf_index = receipt
+        let event = receipt
             .inner
             .logs()
             .iter()
             .filter(|l| l.address() == pool.address)
             .find_map(|l| ITornadoInstance::Deposit::decode_log_data(l.data()).ok())
             .filter(|ev| ev.commitment == commitment)
-            .map(|ev| ev.leafIndex)
             .ok_or_else(|| Error::Eth("deposit event not found in receipt".into()))?;
         Ok(DepositReceipt {
             tx_hash,
             block_number: receipt.block_number.unwrap_or_default(),
-            leaf_index,
+            timestamp: event.timestamp.saturating_to(),
+            leaf_index: event.leafIndex,
             gas_used,
             fee,
         })
@@ -830,6 +832,29 @@ impl TornadoClient {
             return Err(Error::Eth(format!("withdraw transaction {tx:#x} reverted")));
         }
         Ok(tx)
+    }
+
+    /// Block number and timestamp (Unix seconds) of the block that included
+    /// `tx`, or `None` if it is not mined or reverted.
+    pub async fn tx_inclusion(&self, tx: B256) -> Result<Option<(u64, u64)>> {
+        let Some(r) = self
+            .provider
+            .get_transaction_receipt(tx)
+            .await
+            .map_err(eth_err)?
+        else {
+            return Ok(None);
+        };
+        let Some(number) = r.block_number.filter(|_| r.status()) else {
+            return Ok(None);
+        };
+        let block = self
+            .provider
+            .get_block_by_number(number.into())
+            .await
+            .map_err(eth_err)?
+            .ok_or_else(|| Error::Eth(format!("block {number} not found")))?;
+        Ok(Some((number, block.header.timestamp)))
     }
 
     /// Gas used by mined transaction `tx` and the fee it paid, in the native

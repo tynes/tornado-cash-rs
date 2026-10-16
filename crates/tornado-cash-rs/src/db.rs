@@ -107,6 +107,9 @@ pub struct NoteRecord {
     pub deposit_tx: Option<B256>,
     #[serde(default)]
     pub deposit_block: Option<u64>,
+    /// Timestamp of `deposit_block`, in Unix seconds.
+    #[serde(default)]
+    pub deposit_time: Option<u64>,
     #[serde(default)]
     pub leaf_index: Option<u32>,
     /// Account that sent the deposit, when this CLI sent it. Unknown for
@@ -115,6 +118,12 @@ pub struct NoteRecord {
     pub depositor: Option<Address>,
     #[serde(default)]
     pub withdraw_tx: Option<B256>,
+    /// Block that included `withdraw_tx`.
+    #[serde(default)]
+    pub withdraw_block: Option<u64>,
+    /// Timestamp of `withdraw_block`, in Unix seconds.
+    #[serde(default)]
+    pub withdraw_time: Option<u64>,
     #[serde(default)]
     pub withdraw_recipient: Option<Address>,
 }
@@ -372,9 +381,12 @@ impl NoteDb {
             label: None,
             deposit_tx: None,
             deposit_block: None,
+            deposit_time: None,
             leaf_index: None,
             depositor: None,
             withdraw_tx: None,
+            withdraw_block: None,
+            withdraw_time: None,
             withdraw_recipient: None,
         });
         self.save()?;
@@ -598,9 +610,12 @@ mod tests {
             label: None,
             deposit_tx: None,
             deposit_block: None,
+            deposit_time: None,
             leaf_index: None,
             depositor: Some(Address::repeat_byte(1)),
             withdraw_tx: None,
+            withdraw_block: None,
+            withdraw_time: None,
             withdraw_recipient: None,
         })
         .unwrap();

@@ -13,7 +13,7 @@ use clap::Subcommand;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use tornado_cash_rs::chains::{
-    all_chains, chain_by_id, chain_by_name, format_units, parse_units, Tier,
+    all_chains, chain_by_id, chain_by_name, format_units, parse_units, Pool, Tier,
 };
 use tornado_cash_rs::db::{NoteDb, NoteFilter, NoteRecord, NoteStatus};
 use tornado_cash_rs::error::Error;
@@ -665,6 +665,7 @@ async fn deposit(app: &App, currency: &str, amount: &str, yes: bool) -> Result<(
     db.update(&id, |rec| {
         rec.status = NoteStatus::Deposited;
         rec.deposit_block = Some(r.block_number);
+        rec.deposit_time = Some(r.timestamp);
         rec.leaf_index = Some(r.leaf_index);
     })?;
     println!(
@@ -878,9 +879,19 @@ async fn withdraw(
             rec.id
         );
     }
+    let included = client.tx_inclusion(tx).await.unwrap_or_else(|e| {
+        eprintln!(
+            "could not read the withdrawal's block ({e}); `balances --check` will fill it in"
+        );
+        None
+    });
     db.update(&rec.id, |r| {
         r.status = NoteStatus::Spent;
         r.withdraw_recipient = Some(recipient);
+        if let Some((block, time)) = included {
+            r.withdraw_block = Some(block);
+            r.withdraw_time = Some(time);
+        }
     })?;
     println!("Withdrew note {} in {}", rec.id, client.tx_url(&tx));
     match client.tx_cost(tx).await {
@@ -990,6 +1001,44 @@ fn known_relayers_help() -> String {
     s
 }
 
+/// Fill in the block and time of a note's known deposit and withdrawal
+/// transactions when an earlier run lost track of them (a crash, an RPC timeout).
+async fn backfill_inclusion(
+    client: &TornadoClient,
+    db: &mut NoteDb,
+    id: &str,
+    pool: &Pool,
+) -> Result<()> {
+    let rec = db.get(id)?.clone();
+    if let (Some(tx), None, NoteStatus::Deposited | NoteStatus::Spent) =
+        (rec.deposit_tx, rec.deposit_time, rec.status)
+    {
+        // The hash is saved before sending, so the tx may never have landed.
+        if let Some((block, time)) = client.tx_inclusion(tx).await? {
+            db.update(id, |r| {
+                r.deposit_block = Some(block);
+                r.deposit_time = Some(time);
+            })?;
+        }
+    }
+    if let (Some(tx), None, NoteStatus::Spent) = (rec.withdraw_tx, rec.withdraw_time, rec.status) {
+        // Only record it if this tx is the one that spent the note.
+        if let Some((block, time)) = client.tx_inclusion(tx).await? {
+            if client
+                .confirm_withdrawal(pool, tx, rec.note.nullifier_hash_bytes())
+                .await
+                .is_ok()
+            {
+                db.update(id, |r| {
+                    r.withdraw_block = Some(block);
+                    r.withdraw_time = Some(time);
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn balances(app: &App, check: bool) -> Result<()> {
     let mut db = app.open_db()?;
     if check {
@@ -1038,6 +1087,7 @@ async fn balances(app: &App, check: bool) -> Result<()> {
                 );
                 db.update(&id, |r| r.status = NoteStatus::Deposited)?;
             }
+            backfill_inclusion(&client, &mut db, &id, &pool).await?;
         }
     }
     let bals = db.balances();
@@ -1245,9 +1295,12 @@ mod tests {
             label: None,
             deposit_tx: None,
             deposit_block: None,
+            deposit_time: None,
             leaf_index: None,
             depositor: None,
             withdraw_tx: None,
+            withdraw_block: None,
+            withdraw_time: None,
             withdraw_recipient: None,
         };
         // Notes without a recorded depositor are not checked.
