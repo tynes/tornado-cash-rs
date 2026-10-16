@@ -22,7 +22,7 @@ use std::time::Instant;
 use tower::{Layer, Service};
 
 /// The tracing target for network events.
-pub const TARGET: &str = "tornado_cash_rs::net";
+pub const TARGET: &str = "network";
 
 /// `scheme://host:port` of `url`, with `/…` appended when a path, query or
 /// credentials were dropped.

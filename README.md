@@ -53,23 +53,34 @@ To sign with a Ledger instead of a private key, open the Ethereum app on the dev
 `TORNADO_RS_LEDGER=true`). It uses Ledger Live account 0 by default; pick another with `--ledger-index <n>`, or give a
 full path with `--hd-path "m/44'/60'/0'/0"`. On Linux you may need Ledger's udev rules to reach the device.
 
-### Seeing network activity
+### Logging
 
-`--log-network` (or `TORNADO_RS_LOG_NETWORK=summary`) prints one line to stderr for every request the CLI
-sends: what it is, where it goes, the result, the response size and the time taken. It also says whether
-traffic goes through a proxy and who resolves hostnames.
+Logs go to stderr. Two flags control them, and they combine:
+
+| flag | shows |
+| --- | --- |
+| `--log-level info` | main steps: chain detected, deposit sync progress, proof generation, relayer jobs |
+| `--log-level debug` | adds detail: each `eth_getLogs` chunk, Merkle tree build, relayer fee breakdown, job polling |
+| `--log-network` | one line per network request: what it is, where it goes, result, size and time |
+| `--log-network=full` | adds request and response bodies |
+| `--log-network=connections` | adds each TCP/TLS connection, the address it actually reaches and proxy hops |
+
+Without flags only warnings are shown. `TORNADO_RS_LOG_LEVEL` and `TORNADO_RS_LOG_NETWORK` set the same options,
+and `TORNADO_RS_LOG` takes a full [tracing filter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+for anything finer; the flags apply on top of it.
 
 ```
-INFO tornado_cash_rs::net: no proxy: requests connect directly and hostnames are resolved by the system resolver
-INFO tornado_cash_rs::net: POST https://mainnet.infura.io/… [rpc eth_chainId] -> ok, 5 B in 464 ms
-INFO tornado_cash_rs::net: GET https://raw.githubusercontent.com/…/tornado.json [download tornado.json] -> 200 OK, 18.6 MiB in 1509 ms
+INFO network: no proxy: requests connect directly and hostnames are resolved by the system resolver
+INFO tornado_cash_rs::eth: connected to mainnet (chain 1)
+INFO network: POST https://mainnet.infura.io/… [rpc eth_getLogs] -> ok, 10.2 KiB in 431 ms
+INFO network: GET https://raw.githubusercontent.com/…/tornado.json [download tornado.json] -> 200 OK, 18.6 MiB in 1509 ms
 ```
 
-RPC URLs are shown as origin only (`/…`), since they often carry an API key. `--log-network=full` also prints
-request and response bodies: RPC parameters and results, signed transactions, relayer requests with the
-proof and recipient. Treat that output as sensitive. The CLI talks only to the RPC endpoint, the relayer you
-pass (or the known relayers `--relay` tries), and `raw.githubusercontent.com` for the proving artifacts. For connection-level detail (DNS, TLS,
-connection reuse), add `TORNADO_RS_LOG=hyper_util=debug,reqwest=debug`.
+The network log starts by saying whether traffic goes through a proxy and who resolves hostnames. RPC URLs are
+shown as origin only (`/…`), since they often carry an API key. `--log-network=full` prints RPC parameters and
+results, signed transactions, and relayer requests with the proof and recipient, so treat that output as
+sensitive. The CLI talks only to the RPC endpoint, the relayer you pass (or the known relayers `--relay` tries),
+and `raw.githubusercontent.com` for the proving artifacts.
 
 ## Supported chains
 

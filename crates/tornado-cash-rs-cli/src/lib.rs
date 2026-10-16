@@ -46,8 +46,18 @@ pub struct Cli {
     #[arg(long, global = true, env = "TORNADO_RS_PROXY")]
     proxy: Option<String>,
 
+    /// How much the CLI logs to stderr. Warnings only by default.
+    #[arg(
+        long,
+        global = true,
+        env = "TORNADO_RS_LOG_LEVEL",
+        value_name = "LEVEL"
+    )]
+    log_level: Option<LogLevel>,
+
     /// Log every network request to stderr: what it is, where it goes, status, size and time.
-    /// `full` also logs request and response bodies (addresses, proofs, signed transactions).
+    /// `full` also logs request and response bodies (addresses, proofs, signed transactions);
+    /// `connections` adds each TCP/TLS connection and the address it actually reaches.
     #[arg(
         long,
         global = true,
@@ -111,21 +121,60 @@ pub struct Cli {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
+enum LogLevel {
+    /// Problems only.
+    Warn,
+    /// Main steps: chain, sync progress, proofs, relayer jobs.
+    Info,
+    /// Details such as each log-scan chunk and fee breakdowns.
+    Debug,
+    /// Everything.
+    Trace,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum NetLog {
     /// One line per request.
     Summary,
     /// Request and response bodies as well.
     Full,
+    /// One line per request plus connection-level events.
+    Connections,
 }
 
+/// Crates whose logs `--log-level` controls.
+const APP_TARGETS: [&str; 2] = ["tornado_cash_rs", "tornado_cash_rs_cli"];
+
 impl Cli {
-    /// The tracing directive `--log-network` asks for, if any.
-    pub fn network_log_directive(&self) -> Option<String> {
-        let level = match self.log_network? {
-            NetLog::Summary => "info",
-            NetLog::Full => "trace",
+    /// The tracing filter for this invocation. `env` is `TORNADO_RS_LOG`,
+    /// which replaces the default filter; the flags then apply on top of it.
+    pub fn log_filter(&self, env: Option<&str>) -> String {
+        let mut d: Vec<String> = match env.filter(|e| !e.trim().is_empty()) {
+            Some(e) => vec![e.to_string()],
+            None => std::iter::once("error".to_string())
+                .chain(APP_TARGETS.iter().map(|t| format!("{t}=warn")))
+                .collect(),
         };
-        Some(format!("{}={level}", tornado_cash_rs::net::TARGET))
+        if let Some(level) = self.log_level {
+            let level = match level {
+                LogLevel::Warn => "warn",
+                LogLevel::Info => "info",
+                LogLevel::Debug => "debug",
+                LogLevel::Trace => "trace",
+            };
+            d.extend(APP_TARGETS.iter().map(|t| format!("{t}={level}")));
+        }
+        let net = tornado_cash_rs::net::TARGET;
+        match self.log_network {
+            None => {}
+            Some(NetLog::Summary) => d.push(format!("{net}=info")),
+            Some(NetLog::Full) => d.push(format!("{net}=trace")),
+            Some(NetLog::Connections) => {
+                d.push(format!("{net}=info"));
+                d.extend(["reqwest=debug", "hyper_util=debug"].map(String::from));
+            }
+        }
+        d.join(",")
     }
 }
 
@@ -1297,5 +1346,95 @@ mod tests {
         assert!(parse(&["--relay", "--calldata"]).is_err());
         assert!(known_relayers_help().contains("eth.reltor.su"));
         assert!(default_relayer_help().contains("eth.reltor.su"));
+    }
+
+    /// Which (target, level) pairs the filter built from `args` lets through.
+    fn enabled(
+        args: &[&str],
+        env: Option<&str>,
+        target_level: &[(&str, tracing::Level)],
+    ) -> Vec<bool> {
+        use tracing::subscriber::with_default;
+        let mut argv = vec!["tornado-rs"];
+        argv.extend(args);
+        argv.push("pools");
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let filter = tracing_subscriber::EnvFilter::try_new(cli.log_filter(env)).unwrap();
+        let sub = tracing_subscriber::fmt().with_env_filter(filter).finish();
+        with_default(sub, || {
+            target_level
+                .iter()
+                .map(|(t, l)| match (*t, *l) {
+                    ("tornado_cash_rs", tracing::Level::INFO) => {
+                        tracing::enabled!(target: "tornado_cash_rs", tracing::Level::INFO)
+                    }
+                    ("tornado_cash_rs", tracing::Level::DEBUG) => {
+                        tracing::enabled!(target: "tornado_cash_rs", tracing::Level::DEBUG)
+                    }
+                    ("tornado_cash_rs", tracing::Level::WARN) => {
+                        tracing::enabled!(target: "tornado_cash_rs", tracing::Level::WARN)
+                    }
+                    ("network", tracing::Level::INFO) => {
+                        tracing::enabled!(target: "network", tracing::Level::INFO)
+                    }
+                    ("network", tracing::Level::TRACE) => {
+                        tracing::enabled!(target: "network", tracing::Level::TRACE)
+                    }
+                    ("hyper_util", tracing::Level::DEBUG) => {
+                        tracing::enabled!(target: "hyper_util", tracing::Level::DEBUG)
+                    }
+                    other => panic!("add a case for {other:?}"),
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn log_flags_pick_levels() {
+        use tracing::Level;
+        let probes = [
+            ("tornado_cash_rs", Level::WARN),
+            ("tornado_cash_rs", Level::INFO),
+            ("tornado_cash_rs", Level::DEBUG),
+            ("network", Level::INFO),
+            ("network", Level::TRACE),
+            ("hyper_util", Level::DEBUG),
+        ];
+        let t = true;
+        let f = false;
+        assert_eq!(enabled(&[], None, &probes), [t, f, f, f, f, f]);
+        assert_eq!(
+            enabled(&["--log-level", "info"], None, &probes),
+            [t, t, f, f, f, f]
+        );
+        assert_eq!(
+            enabled(&["--log-level", "debug"], None, &probes),
+            [t, t, t, f, f, f]
+        );
+        assert_eq!(
+            enabled(&["--log-network"], None, &probes),
+            [t, f, f, t, f, f]
+        );
+        assert_eq!(
+            enabled(&["--log-network=full"], None, &probes),
+            [t, f, f, t, t, f]
+        );
+        assert_eq!(
+            enabled(&["--log-network=connections"], None, &probes),
+            [t, f, f, t, f, t]
+        );
+        // The flags apply on top of TORNADO_RS_LOG.
+        assert_eq!(
+            enabled(
+                &["--log-level", "warn"],
+                Some("tornado_cash_rs=debug,network=info"),
+                &probes
+            ),
+            [t, f, f, t, f, f]
+        );
+        assert_eq!(
+            enabled(&[], Some("network=trace"), &probes),
+            [f, f, f, t, t, f]
+        );
     }
 }

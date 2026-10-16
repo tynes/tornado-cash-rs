@@ -53,10 +53,12 @@ impl Artifact {
         let path = dir.join(self.file_name);
         if let Ok(bytes) = std::fs::read(&path) {
             if sha256_hex(&bytes) == self.sha256 {
+                tracing::debug!("using cached {}", path.display());
                 return Ok(bytes);
             }
             tracing::warn!("{} failed its checksum, downloading again", path.display());
         }
+        tracing::info!("downloading {} from {}", self.file_name, self.url);
         let what = format!("download {}", self.file_name);
         let bytes = crate::net::fetch(client, client.get(self.url), &what, true, true)
             .await?

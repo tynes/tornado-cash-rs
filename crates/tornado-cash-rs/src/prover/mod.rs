@@ -118,11 +118,22 @@ impl Prover {
             "pathElements": path.path_elements.iter().map(d).collect::<Vec<_>>(),
             "pathIndices": path.path_indices.iter().map(|b| if *b { "1" } else { "0" }).collect::<Vec<_>>(),
         });
+        tracing::info!("generating withdrawal proof");
+        tracing::debug!(
+            "proof inputs: root {:#x}, recipient {recipient}, relayer {relayer}, fee {fee}, refund {refund}",
+            args.root
+        );
+        let start = std::time::Instant::now();
         let w = self.circuit.calculate_witness(&input)?;
+        tracing::debug!("witness computed in {} ms", start.elapsed().as_millis());
         let proof = self.pk.prove(&w, &mut rand::thread_rng())?;
         if !self.vk.verify(&proof, &pubs) {
             return Err(Error::ProofSelfCheck);
         }
+        tracing::info!(
+            "proof generated and self-verified in {} ms",
+            start.elapsed().as_millis()
+        );
         Ok(WithdrawProof { proof, args })
     }
 }

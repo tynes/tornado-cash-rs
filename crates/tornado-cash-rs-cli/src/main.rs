@@ -3,10 +3,8 @@ use tornado_cash_rs_cli::{run, Cli, Parser};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let mut filter = tracing_subscriber::EnvFilter::from_env("TORNADO_RS_LOG");
-    if let Some(d) = cli.network_log_directive() {
-        filter = filter.add_directive(d.parse()?);
-    }
+    let env = std::env::var("TORNADO_RS_LOG").ok();
+    let filter = tracing_subscriber::EnvFilter::try_new(cli.log_filter(env.as_deref()))?;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

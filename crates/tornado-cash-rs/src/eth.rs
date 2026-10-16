@@ -251,12 +251,19 @@ pub fn approvals_needed(allowance: U256, needed: U256) -> Vec<U256> {
 
 /// Build the pool's Merkle tree from commitments in leaf order.
 pub fn build_tree(commitments: &[B256]) -> Result<MerkleTree> {
-    MerkleTree::new(
+    let start = std::time::Instant::now();
+    let tree = MerkleTree::new(
         commitments
             .iter()
             .map(|c| fr_from_be_bytes(c.as_slice()))
             .collect(),
-    )
+    )?;
+    tracing::debug!(
+        "built Merkle tree of {} leaves in {} ms",
+        commitments.len(),
+        start.elapsed().as_millis()
+    );
+    Ok(tree)
 }
 
 /// Options for event scanning.
@@ -305,6 +312,7 @@ async fn scan<S: DepositSource>(
         let end = (start + span - 1).min(to);
         match src.deposits(pool, start, end).await {
             Ok(events) => {
+                tracing::debug!("blocks {start}..={end}: {} deposits", events.len());
                 for (idx, commitment) in events {
                     if idx as usize != out.len() {
                         return Err(Error::Eth(format!(
@@ -340,6 +348,12 @@ pub async fn sync_deposits<S: DepositSource>(
 ) -> Result<Vec<B256>> {
     let latest = src.latest_block().await?;
     let safe = latest.saturating_sub(opts.confirmations);
+    tracing::info!(
+        "syncing deposits for pool {}: {} cached up to block {}, chain head {latest}",
+        pool.address,
+        cache.commitments.len(),
+        cache.last_block
+    );
 
     let stale = match cache.last_block_hash {
         Some(h) => cache.last_block > latest || src.block_hash(cache.last_block).await? != Some(h),
@@ -393,6 +407,13 @@ pub async fn sync_deposits<S: DepositSource>(
         &mut |b| progress(b, latest),
     )
     .await?;
+    tracing::info!(
+        "pool {} has {} deposits ({} cached up to block {})",
+        pool.address,
+        all.len(),
+        cache.commitments.len(),
+        cache.last_block
+    );
     Ok(all)
 }
 
@@ -470,6 +491,10 @@ impl TornadoClient {
         };
         let chain_id = provider.get_chain_id().await.map_err(eth_err)?;
         let chain = chain_by_id(chain_id)?;
+        tracing::info!("connected to {} (chain {chain_id})", chain.name);
+        if let Some(s) = sender {
+            tracing::debug!("sending transactions from {s}");
+        }
         Ok(TornadoClient {
             provider,
             chain,
